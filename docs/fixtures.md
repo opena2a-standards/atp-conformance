@@ -32,8 +32,14 @@ versions the fixtures pin, and the rules for changing the fixture set.
   authority to source a real cosigned proof from. Will be added once a real
   federation peer exists.
 - §8.1 response authenticity. The spec does not sign the revocation body
-  (transport plus each entry's `transparencyLogIndex` carry authenticity);
-  the fixtures cover the structural rules only.
+  (the transport carries authenticity, plus `transparencyLogIndex` on an
+  entry that carries one; an entry without it rests on the transport
+  alone); the fixtures cover the structural rules only.
+- §8.1 entries without a `transparencyLogIndex`. ATP §8.1 makes the member
+  OPTIONAL: a client MUST apply such an entry exactly as one with the index
+  and MUST NOT reject the entry or the response for its absence. No fixture
+  carries such an entry yet, and the revocation schema vendored here
+  predates the change and still lists the member as required.
 
 ## Fixtures
 
