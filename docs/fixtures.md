@@ -57,7 +57,22 @@ All fixtures use:
 | `fixtures/discovery-valid.json` | discovery | ACCEPT | Well-formed `/.well-known/atp` response: required fields, `conformanceLevel` in `[1,3]`, structurally valid `publicKeys` (both Ed25519 and ML-DSA-65 entries). |
 | `fixtures/trust-proof-baseline.json` | trustProof | ACCEPT | Trust proof with one Ed25519 signature over the 7-field canonical payload. MUST-implement baseline. |
 | `fixtures/trust-proof-hybrid.json` | trustProof | ACCEPT | Trust proof with both Ed25519 AND ML-DSA-65 signatures over the same canonical payload. Production wire format. |
+| `fixtures/trust-proof-expired.json` | trustProof | REJECT (`EXPIRED`) | Trust proof with a valid Ed25519 signature over a 12-hour window (`2024-12-31T12:00:00Z` to `2025-01-01T00:00:00Z`) that ends before the pinned verifier clock. Expiry is the sole defect (ATP §4.4 step 1). |
+| `fixtures/trust-proof-untrusted-issuer.json` | trustProof | REJECT (`UNTRUSTED_ISSUER`) | The baseline trust proof, unchanged, checked by a verifier whose `trustedIssuers` holds only `did:opena2a:authority:partner.example` (ATP §4.4 step 2). |
+| `fixtures/trust-proof-tampered-signature.json` | trustProof | REJECT (`SIGNATURE_INVALID`) | The baseline trust proof with the first byte of its Ed25519 signature XOR 0xFF; every other field is unchanged (ATP §4.4 step 4). |
+| `fixtures/trust-proof-window-exceeds-max.json` | trustProof | REJECT (`SEMANTIC_INVALID`) | The baseline trust proof re-signed with `expiresAt` 25 hours after `issuedAt`. Signature valid, issuer trusted, clock inside the window: the ATP §10.2 24-hour maximum is the sole defect (ATP §4.4 step 5). |
 | `fixtures/transparency-log-sth.json` | sth | ACCEPT | Signed Tree Head with Ed25519 signature over the raw 32-byte decoded `rootHash`. Compatible with RFC 6962 §3.5 CT monitor expectations. |
+| `fixtures/transparency-inclusion-proof-valid.json` | inclusionProof | ACCEPT | RFC 6962 audit path for log entry 3 of the deterministic 8-leaf conformance tree, with a Signed Tree Head over that tree's root. The STH verifies (ATP §5.6), and recomputing the root from `leafHash` along `auditPath` reproduces `signedTreeHead.rootHash` (ATP §5.4). |
+| `fixtures/transparency-inclusion-proof-tampered-path.json` | inclusionProof | REJECT (`PROOF_INVALID`) | The valid inclusion proof with the first byte of `auditPath[0]` XOR 0xFF. The STH still verifies; only the root recomputation catches the change. |
+| `fixtures/transparency-consistency-proof-valid.json` | consistencyProof | ACCEPT | Consistency proof from the 4-leaf to the 8-leaf state of the same conformance tree, with a Signed Tree Head over each root. Both STHs verify, and both roots are reproduced from `consistencyPath` (ATP §5.5, the append-only property). |
+| `fixtures/transparency-consistency-proof-tampered-path.json` | consistencyProof | REJECT (`PROOF_INVALID`) | The valid consistency proof with the first byte of `consistencyPath[0]` XOR 0xFF. Both STHs still verify; only the root recomputation catches the broken append-only claim. |
+| `fixtures/revocation-list-valid.json` | revocationList | ACCEPT | The ATP §8.1 spec example revocation response body. The body is unsigned by design, so verification checks its required members and RFC 3339 timestamps. |
+| `fixtures/revocation-list-malformed-timestamp.json` | revocationList | REJECT (`PARSE_ERROR`) | The §8.1 body with `revokedAt` written as `2026-03-22 15:00:00`, which is not RFC 3339. Skipping an unparseable revocation would keep a revoked agent trusted, so the body is rejected. |
+
+Expected is the outcome pinned in each fixture's `expected` block; a REJECT
+also pins its reject category. CI runs `scripts/check_readme_counts.py`, which
+fails when this table and `fixtures/` disagree: each fixture needs exactly one
+row, with its `fixtureType` as Type and its expected outcome as Expected.
 
 ## Version pinning
 
