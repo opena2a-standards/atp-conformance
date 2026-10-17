@@ -529,6 +529,21 @@ def verify_revocation_list(fixture: dict[str, Any]) -> VerifyResult:
 # ---------------------------------------------------------------------------
 
 def verify_fixture(fixture: dict[str, Any]) -> VerifyResult:
+    # A member of the wrong JSON type (null, a string where an integer is
+    # required, a number where an object is required) surfaces as one of
+    # these exceptions inside the per-type verifiers. It is a PARSE_ERROR for
+    # this fixture, not a reason to abort the run.
+    try:
+        return _verify_fixture(fixture)
+    except (TypeError, ValueError, AttributeError, KeyError, IndexError) as exc:
+        ft = fixture.get("fixtureType") if isinstance(fixture, dict) else None
+        return VerifyResult(
+            reject_category="PARSE_ERROR",
+            reason=f"malformed {ft or 'fixture'} member: {type(exc).__name__}: {exc}",
+        )
+
+
+def _verify_fixture(fixture: dict[str, Any]) -> VerifyResult:
     ft = fixture.get("fixtureType")
     if ft == "discovery":
         return verify_discovery(fixture)
@@ -546,7 +561,10 @@ def verify_fixture(fixture: dict[str, Any]) -> VerifyResult:
 
 
 def load_fixture(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text())
+    fixture = json.loads(path.read_text())
+    if not isinstance(fixture, dict):
+        raise ValueError(f"top-level JSON value is {type(fixture).__name__}, not an object")
+    return fixture
 
 
 def expand_paths(args: list[str]) -> list[Path]:
@@ -587,14 +605,16 @@ def main(argv: list[str]) -> int:
             continue
 
         got = verify_fixture(fixture)
-        expected = fixture.get("expected", {})
-        want_accept = expected.get("verifyResult", "").upper() == "ACCEPT"
+        expected = fixture.get("expected")
+        if not isinstance(expected, dict):
+            expected = {}
+        want_accept = str(expected.get("verifyResult", "")).upper() == "ACCEPT"
 
         ok = (want_accept and got.accepted) or (not want_accept and not got.accepted)
         if ok and not want_accept and expected.get("rejectCategory"):
             ok = got.reject_category == expected["rejectCategory"]
         if ok and not want_accept and expected.get("reasonContains"):
-            ok = expected["reasonContains"].lower() in got.reason.lower()
+            ok = str(expected["reasonContains"]).lower() in got.reason.lower()
 
         status = "PASS" if ok else "FAIL"
         if ok:

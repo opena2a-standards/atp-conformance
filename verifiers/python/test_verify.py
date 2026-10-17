@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Regression tests for the ATP §8.1 revocation-entry checks in verify.py.
+"""Regression tests for verify.py: the ATP §8.1 revocation-entry checks and
+the PARSE_ERROR verdict for members of the wrong JSON type.
 
 Run from this directory:
     python3 -m unittest -v test_verify
@@ -7,7 +8,12 @@ Run from this directory:
 
 from __future__ import annotations
 
+import contextlib
+import io
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from typing import Any
 
 import verify
@@ -56,6 +62,91 @@ class TransparencyLogIndexTest(unittest.TestCase):
         self.assertFalse(got.accepted)
         self.assertEqual(got.reject_category, "PARSE_ERROR")
         self.assertIn("transparencyLogIndex", got.reason)
+
+
+FIXTURES = Path(__file__).resolve().parents[2] / "fixtures"
+
+
+def load(name: str) -> dict[str, Any]:
+    return json.loads((FIXTURES / name).read_text())
+
+
+def revocation_with(**overrides: Any) -> dict[str, Any]:
+    fx = load("revocation-list-valid.json")
+    fx["revocationList"]["revocations"][0].update(overrides)
+    return fx
+
+
+class MalformedMemberTest(unittest.TestCase):
+    """A member of the wrong JSON type is a PARSE_ERROR verdict, not an exception."""
+
+    def assert_parse_error(self, fixture: dict[str, Any]) -> None:
+        got = verify.verify_fixture(fixture)
+        self.assertFalse(got.accepted, str(got))
+        self.assertEqual(got.reject_category, "PARSE_ERROR", str(got))
+
+    def test_transparency_log_index_wrong_type(self) -> None:
+        for value in ("abc", "", "0x10", {}, []):
+            with self.subTest(value=value):
+                self.assert_parse_error(revocation_with(transparencyLogIndex=value))
+
+    def test_revocations_null(self) -> None:
+        fx = load("revocation-list-valid.json")
+        fx["revocationList"]["revocations"] = None
+        self.assert_parse_error(fx)
+
+    def test_revoked_by_key_id_null(self) -> None:
+        self.assert_parse_error(revocation_with(revokedByKeyId=None))
+
+    def test_agent_did_number(self) -> None:
+        self.assert_parse_error(revocation_with(agentDid=42))
+
+    def test_revocation_entry_number(self) -> None:
+        fx = load("revocation-list-valid.json")
+        fx["revocationList"]["revocations"][0] = 7
+        self.assert_parse_error(fx)
+
+    def test_inclusion_log_index_null(self) -> None:
+        fx = load("transparency-inclusion-proof-valid.json")
+        fx["inclusionProof"]["logIndex"] = None
+        self.assert_parse_error(fx)
+
+    def test_sth_tree_size_null(self) -> None:
+        fx = load("transparency-log-sth.json")
+        fx["signedTreeHead"]["treeSize"] = None
+        self.assert_parse_error(fx)
+
+    def test_consistency_from_size_null(self) -> None:
+        fx = load("transparency-consistency-proof-valid.json")
+        fx["consistencyProof"]["fromSize"] = None
+        self.assert_parse_error(fx)
+
+    def test_discovery_conformance_level_wrong_type(self) -> None:
+        for value in (None, "2"):
+            with self.subTest(value=value):
+                fx = load("discovery-valid.json")
+                fx["discoveryResponse"]["conformanceLevel"] = value
+                self.assert_parse_error(fx)
+
+
+class DirectoryRunTest(unittest.TestCase):
+    """A malformed fixture in a directory run does not stop the fixtures after it."""
+
+    def test_run_continues_and_prints_summary(self) -> None:
+        valid = load("revocation-list-valid.json")
+        bad = revocation_with(transparencyLogIndex="abc")
+        with tempfile.TemporaryDirectory() as d:
+            for name, fx in (("a-valid.json", valid), ("b-bad.json", bad), ("c-valid.json", valid)):
+                (Path(d) / name).write_text(json.dumps(fx))
+            (Path(d) / "d-array.json").write_text("[]")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = verify.main(["verify.py", d])
+        lines = out.getvalue().splitlines()
+        self.assertEqual(code, 1)
+        self.assertEqual([ln.split()[0] for ln in lines if ln.startswith(("PASS", "FAIL"))], ["PASS", "FAIL", "PASS", "FAIL"])
+        self.assertIn("REJECT[PARSE_ERROR", out.getvalue())
+        self.assertEqual(lines[-1], "summary: 2 pass, 2 fail (4 fixtures)")
 
 
 if __name__ == "__main__":
