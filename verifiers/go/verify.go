@@ -30,9 +30,11 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -45,18 +47,22 @@ import (
 // ---------------------------------------------------------------------------
 
 type fixture struct {
-	Name              string             `json:"name"`
-	Description       string             `json:"description"`
-	FixtureType       string             `json:"fixtureType"`
-	KeypairRefs       []keypairRef       `json:"keypairRefs"`
-	VerifierState     verifierState      `json:"verifierState"`
-	Expected          expectedOutcome    `json:"expected"`
-	DiscoveryResponse *discoveryResponse `json:"discoveryResponse,omitempty"`
-	TrustProof        *trustProof        `json:"trustProof,omitempty"`
-	SignedTreeHead    *signedTreeHead    `json:"signedTreeHead,omitempty"`
-	InclusionProof    *inclusionProof    `json:"inclusionProof,omitempty"`
-	ConsistencyProof  *consistencyProof  `json:"consistencyProof,omitempty"`
-	RevocationList    *revocationList    `json:"revocationList,omitempty"`
+	Name          string          `json:"name"`
+	Description   string          `json:"description"`
+	FixtureType   string          `json:"fixtureType"`
+	KeypairRefs   []keypairRef    `json:"keypairRefs"`
+	VerifierState verifierState   `json:"verifierState"`
+	Expected      expectedOutcome `json:"expected"`
+	// The payload members stay raw here and are decoded by the per-type
+	// verifier through decodePayload, so a member whose JSON type or range
+	// does not fit its struct is a REJECT[PARSE_ERROR] verdict on the
+	// fixture rather than a load error with no verdict.
+	DiscoveryResponse json.RawMessage `json:"discoveryResponse,omitempty"`
+	TrustProof        json.RawMessage `json:"trustProof,omitempty"`
+	SignedTreeHead    json.RawMessage `json:"signedTreeHead,omitempty"`
+	InclusionProof    json.RawMessage `json:"inclusionProof,omitempty"`
+	ConsistencyProof  json.RawMessage `json:"consistencyProof,omitempty"`
+	RevocationList    json.RawMessage `json:"revocationList,omitempty"`
 }
 
 // inclusionProof mirrors ATP §5.4 (see the generator for the wire contract).
@@ -145,7 +151,7 @@ type trustProof struct {
 	ExpiresAt            string           `json:"expiresAt"`
 	IssuerDID            string           `json:"issuerDid"`
 	Signatures           []proofSignature `json:"signatures"`
-	TransparencyLogIndex int64            `json:"transparencyLogIndex,omitempty"`
+	TransparencyLogIndex *int64           `json:"transparencyLogIndex,omitempty"` // optional, as on a §8.1 entry: nil when absent or null
 }
 
 type signedTreeHead struct {
@@ -214,14 +220,146 @@ func (r result) String() string {
 }
 
 // ---------------------------------------------------------------------------
+// payload decoding
+// ---------------------------------------------------------------------------
+
+// decodePayload decodes one payload member into the wire struct the
+// verifier reads. An absent or null payload decodes to nil. A member whose
+// JSON does not fit the struct (a string where the schema says integer, a
+// number with a fraction or exponent in an integer member, an int64
+// overflow, an array where a string is expected, a null where the struct
+// has no pointer) yields a non-empty PARSE_ERROR reason naming the member,
+// so the verdict matches the Python verifier instead of surfacing as a load
+// error. The struct types are the schema's: int / int64 for integer,
+// float64 for number, string for string.
+func decodePayload[T any](label string, raw json.RawMessage) (*T, string) {
+	if len(raw) == 0 {
+		return nil, ""
+	}
+	var out *T
+	if err := json.Unmarshal(raw, &out); err != nil {
+		var typeErr *json.UnmarshalTypeError
+		if errors.As(err, &typeErr) {
+			member := label
+			if typeErr.Field != "" {
+				member += "." + typeErr.Field
+			}
+			return nil, fmt.Sprintf("%s: JSON %s does not fit the %s the schema requires", member, typeErr.Value, schemaWord(typeErr.Type))
+		}
+		return nil, label + ": " + err.Error()
+	}
+	if out != nil {
+		if member, t := nullMember(label, raw, reflect.TypeOf(out).Elem()); member != "" {
+			return nil, fmt.Sprintf("%s: JSON null does not fit the %s the schema requires", member, schemaWord(t))
+		}
+	}
+	return out, ""
+}
+
+// nullMember walks raw along the decode target t (struct fields in
+// declaration order, array elements in order, map keys sorted) and returns
+// the first member that is JSON null where t is not a pointer, with that
+// member's type; "" when there is none. encoding/json decodes such a null
+// silently to the zero value, which would read revocations null as an empty
+// revocation list. JSON null is a value of no schema type, so it is rejected
+// like any other wrong type. A pointer member (an optional
+// transparencyLogIndex, an embedded tree head) takes null as absent and the
+// verification steps judge it. Members are named the way the Python
+// verifier's _decode names them: object.member and array[index].
+func nullMember(label string, raw json.RawMessage, t reflect.Type) (string, reflect.Type) {
+	isNull := strings.TrimSpace(string(raw)) == "null"
+	if t.Kind() == reflect.Pointer {
+		if isNull {
+			return "", nil
+		}
+		return nullMember(label, raw, t.Elem())
+	}
+	if isNull {
+		return label, t
+	}
+	switch t.Kind() {
+	case reflect.Struct:
+		var members map[string]json.RawMessage
+		if json.Unmarshal(raw, &members) != nil {
+			return "", nil
+		}
+		for i := 0; i < t.NumField(); i++ {
+			field := t.Field(i)
+			name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+			if name == "" {
+				name = field.Name
+			}
+			value, present := members[name]
+			if !present || !field.IsExported() || name == "-" {
+				continue
+			}
+			if member, mt := nullMember(label+"."+name, value, field.Type); member != "" {
+				return member, mt
+			}
+		}
+	case reflect.Slice:
+		var elems []json.RawMessage
+		if json.Unmarshal(raw, &elems) != nil {
+			return "", nil
+		}
+		for i, elem := range elems {
+			if member, mt := nullMember(fmt.Sprintf("%s[%d]", label, i), elem, t.Elem()); member != "" {
+				return member, mt
+			}
+		}
+	case reflect.Map:
+		var values map[string]json.RawMessage
+		if json.Unmarshal(raw, &values) != nil {
+			return "", nil
+		}
+		keys := make([]string, 0, len(values))
+		for key := range values {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			if member, mt := nullMember(label+"."+key, values[key], t.Elem()); member != "" {
+				return member, mt
+			}
+		}
+	}
+	return "", nil
+}
+
+// schemaWord names a decode target type in the vendored schemas' words.
+func schemaWord(t reflect.Type) string {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	switch t.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return "integer"
+	case reflect.Float32, reflect.Float64:
+		return "number"
+	case reflect.String:
+		return "string"
+	case reflect.Bool:
+		return "boolean"
+	case reflect.Slice, reflect.Array:
+		return "array"
+	default:
+		return "object"
+	}
+}
+
+// ---------------------------------------------------------------------------
 // per-type verifiers
 // ---------------------------------------------------------------------------
 
 func verifyDiscovery(f fixture) result {
-	if f.DiscoveryResponse == nil {
+	d, parseErr := decodePayload[discoveryResponse]("discoveryResponse", f.DiscoveryResponse)
+	if parseErr != "" {
+		return result{RejectCategory: "PARSE_ERROR", Reason: parseErr}
+	}
+	if d == nil {
 		return result{RejectCategory: "PARSE_ERROR", Reason: "discoveryResponse missing"}
 	}
-	d := f.DiscoveryResponse
 
 	// ATP §7.1 required fields: authorityDid, version, endpoints, publicKeys.
 	if d.AuthorityDID == "" {
@@ -290,10 +428,20 @@ func verifyDiscovery(f fixture) result {
 }
 
 func verifyTrustProof(f fixture) result {
-	if f.TrustProof == nil {
+	tp, parseErr := decodePayload[trustProof]("trustProof", f.TrustProof)
+	if parseErr != "" {
+		return result{RejectCategory: "PARSE_ERROR", Reason: parseErr}
+	}
+	if tp == nil {
 		return result{RejectCategory: "PARSE_ERROR", Reason: "trustProof missing"}
 	}
-	tp := f.TrustProof
+	// transparencyLogIndex sits outside the §4.3 signed form and is not read
+	// here, but the schema says integer, minimum 0: a negative index is a
+	// malformed proof, not a proof to verify. The member is optional, so an
+	// absent or null index is not checked.
+	if tp.TransparencyLogIndex != nil && *tp.TransparencyLogIndex < 0 {
+		return result{RejectCategory: "PARSE_ERROR", Reason: fmt.Sprintf("trustProof.transparencyLogIndex %d must be >= 0", *tp.TransparencyLogIndex)}
+	}
 
 	now, err := time.Parse(time.RFC3339, f.VerifierState.ClockRFC3339)
 	if err != nil {
@@ -406,10 +554,13 @@ func verifyTrustProof(f fixture) result {
 }
 
 func verifySTH(f fixture) result {
-	if f.SignedTreeHead == nil {
+	sth, parseErr := decodePayload[signedTreeHead]("signedTreeHead", f.SignedTreeHead)
+	if parseErr != "" {
+		return result{RejectCategory: "PARSE_ERROR", Reason: parseErr}
+	}
+	if sth == nil {
 		return result{RejectCategory: "PARSE_ERROR", Reason: "signedTreeHead missing"}
 	}
-	sth := f.SignedTreeHead
 
 	if sth.TreeSize <= 0 {
 		return result{RejectCategory: "STH_INVALID", Reason: fmt.Sprintf("treeSize %d must be > 0", sth.TreeSize)}
@@ -576,10 +727,13 @@ func verifyMerkleConsistency(fromSize, toSize int64, path [][sha256.Size]byte, f
 // per §5.6, then the RFC 9162 §2.1.3.2 recomputation from leafHash along
 // auditPath must reproduce sth.rootHash.
 func verifyInclusionProof(f fixture) result {
-	if f.InclusionProof == nil {
+	ip, parseErr := decodePayload[inclusionProof]("inclusionProof", f.InclusionProof)
+	if parseErr != "" {
+		return result{RejectCategory: "PARSE_ERROR", Reason: parseErr}
+	}
+	if ip == nil {
 		return result{RejectCategory: "PARSE_ERROR", Reason: "inclusionProof missing"}
 	}
-	ip := f.InclusionProof
 
 	leaf, err := wireHashBytes(ip.LeafHash)
 	if err != nil {
@@ -611,10 +765,13 @@ func verifyInclusionProof(f fixture) result {
 // verifyConsistencyProof implements ATP §5.5: both embedded tree heads verify
 // per §5.6, then the RFC 9162 §2.1.4.2 algorithm must reproduce both roots.
 func verifyConsistencyProof(f fixture) result {
-	if f.ConsistencyProof == nil {
+	cp, parseErr := decodePayload[consistencyProof]("consistencyProof", f.ConsistencyProof)
+	if parseErr != "" {
+		return result{RejectCategory: "PARSE_ERROR", Reason: parseErr}
+	}
+	if cp == nil {
 		return result{RejectCategory: "PARSE_ERROR", Reason: "consistencyProof missing"}
 	}
-	cp := f.ConsistencyProof
 
 	if cp.FromSignedTreeHead == nil || cp.ToSignedTreeHead == nil {
 		return result{RejectCategory: "PARSE_ERROR", Reason: "fromSignedTreeHead/toSignedTreeHead missing"}
@@ -657,10 +814,13 @@ func verifyConsistencyProof(f fixture) result {
 // unsigned revocation body. A malformed timestamp rejects the WHOLE response
 // — a client that skips unparseable entries keeps trusting a revoked agent.
 func verifyRevocationList(f fixture) result {
-	if f.RevocationList == nil {
+	rl, parseErr := decodePayload[revocationList]("revocationList", f.RevocationList)
+	if parseErr != "" {
+		return result{RejectCategory: "PARSE_ERROR", Reason: parseErr}
+	}
+	if rl == nil {
 		return result{RejectCategory: "PARSE_ERROR", Reason: "revocationList missing"}
 	}
-	rl := f.RevocationList
 
 	if rl.NextSince == "" {
 		return result{RejectCategory: "PARSE_ERROR", Reason: "nextSince missing"}
