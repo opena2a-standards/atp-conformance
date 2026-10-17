@@ -83,10 +83,12 @@ type revocationList struct {
 }
 
 type revocationEntry struct {
-	AgentDID             string `json:"agentDid"`
-	RevokedAt            string `json:"revokedAt"`
-	Reason               string `json:"reason"`
-	TransparencyLogIndex int64  `json:"transparencyLogIndex"`
+	AgentDID  string `json:"agentDid"`
+	RevokedAt string `json:"revokedAt"`
+	Reason    string `json:"reason"`
+	// TransparencyLogIndex is optional. A pointer keeps an absent or null
+	// member (nil) apart from index 0, so only a present index is checked.
+	TransparencyLogIndex *int64 `json:"transparencyLogIndex"`
 	RevokedByKeyID       string `json:"revokedByKeyId"`
 }
 
@@ -676,8 +678,8 @@ func verifyRevocationList(f fixture) result {
 		if entry.Reason == "" {
 			return result{RejectCategory: "PARSE_ERROR", Reason: fmt.Sprintf("revocations[%d].reason missing", i)}
 		}
-		if entry.TransparencyLogIndex < 0 {
-			return result{RejectCategory: "PARSE_ERROR", Reason: fmt.Sprintf("revocations[%d].transparencyLogIndex %d must be >= 0", i, entry.TransparencyLogIndex)}
+		if entry.TransparencyLogIndex != nil && *entry.TransparencyLogIndex < 0 {
+			return result{RejectCategory: "PARSE_ERROR", Reason: fmt.Sprintf("revocations[%d].transparencyLogIndex %d must be >= 0", i, *entry.TransparencyLogIndex)}
 		}
 		if !strings.Contains(entry.RevokedByKeyID, "#") {
 			return result{RejectCategory: "PARSE_ERROR", Reason: fmt.Sprintf("revocations[%d].revokedByKeyId %q is not fragment-qualified", i, entry.RevokedByKeyID)}

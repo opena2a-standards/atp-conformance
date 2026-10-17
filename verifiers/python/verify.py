@@ -514,7 +514,10 @@ def verify_revocation_list(fixture: dict[str, Any]) -> VerifyResult:
             return VerifyResult(reject_category="PARSE_ERROR", reason=f"revocations[{i}].revokedAt is not RFC 3339: {exc}")
         if not entry.get("reason"):
             return VerifyResult(reject_category="PARSE_ERROR", reason=f"revocations[{i}].reason missing")
-        if int(entry.get("transparencyLogIndex", -1)) < 0:
+        # transparencyLogIndex is optional: an absent (or null) index does not
+        # reject the entry or the response. A present index must be >= 0.
+        log_index = entry.get("transparencyLogIndex")
+        if log_index is not None and int(log_index) < 0:
             return VerifyResult(reject_category="PARSE_ERROR", reason=f"revocations[{i}].transparencyLogIndex must be >= 0")
         if "#" not in entry.get("revokedByKeyId", ""):
             return VerifyResult(reject_category="PARSE_ERROR", reason=f"revocations[{i}].revokedByKeyId is not fragment-qualified")
