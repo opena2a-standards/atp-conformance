@@ -11,6 +11,9 @@ Spec coverage:
   - ATP §4.3 canonical pipe-delimited 7-field signing form
   - ATP §5.6 Signed Tree Head verification (Ed25519 over raw rootHash bytes)
   - ATP §7.1 well-known discovery structural verification
+  - wire shape: each payload member must carry the JSON type the vendored
+    schema gives it (decoded with the Go verifier's rules), else the
+    verdict is REJECT[PARSE_ERROR] naming the member
 
 Out of scope:
   - ML-DSA-65 verification. The post-quantum Python library landscape is
@@ -33,6 +36,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -72,11 +76,14 @@ class VerifyResult:
 
 
 def canonical_proof_payload(tp: dict[str, Any]) -> bytes:
-    """Mirror generator/main.go canonicalProofPayload VERBATIM."""
+    """Mirror generator/main.go canonicalProofPayload VERBATIM. tp is the
+    trust proof as _decode returns it, so trustLevel is already an int and
+    trustScore a float: the wire types are checked by _decode rather than
+    coerced here."""
     return (
         f"{tp['did']}|"
-        f"{int(tp['trustLevel'])}|"
-        f"{float(tp['trustScore']):.6f}|"
+        f"{tp['trustLevel']}|"
+        f"{tp['trustScore']:.6f}|"
         f"{tp['verdict']}|"
         f"{_normalize_rfc3339(tp['issuedAt'])}|"
         f"{_normalize_rfc3339(tp['expiresAt'])}|"
@@ -114,29 +121,229 @@ def index_public_keys(refs: list[dict[str, Any]]):
 
 
 # ---------------------------------------------------------------------------
+# wire shape
+#
+# The Go verifier decodes each payload member into a typed struct, so a
+# member whose JSON type does not fit (a string where the schema says
+# integer, a number with a fraction or exponent in an integer member, an
+# array where a string is expected) does not reach its verification steps.
+# The tables below mirror those struct types and _decode applies the same
+# rules before the steps run, so both verifiers return REJECT[PARSE_ERROR]
+# for the same wire values instead of this verifier coercing them with
+# int() / float() or testing strings by duck typing.
+#
+# Leaf kinds:
+#   "string"   a JSON string
+#   "integer"  a JSON number written without fraction or exponent that fits
+#              a signed 64-bit integer (the Go verifier's int64)
+#   "?integer" the same, for a member the spec makes optional: absent and
+#              null both decode to None, apart from 0 (the Go verifier's
+#              *int64)
+#   "number"   a JSON number that fits a binary64 float (the Go verifier's
+#              float64)
+# A one-element list is a JSON array of that shape. A dict is a JSON object:
+# a listed member that is absent takes the Go zero value ("", 0, 0.0, [] or
+# {}), a nested object member that is absent or null decodes to None (a nil
+# pointer, which the verification steps report as missing), and unlisted
+# members are ignored, as encoding/json does. {"*": shape} is a JSON object
+# whose values each have that shape.
+#
+# JSON null is a value of no schema type, so a null member, array element or
+# object value is REJECT[PARSE_ERROR] like any other wrong type rather than
+# the zero value encoding/json would decode it to: revocations null is not an
+# empty revocation list. Only a "?integer" member and a nested object member
+# take null, as absent; the Go verifier's nullMember draws the same line at
+# its pointer fields.
+# ---------------------------------------------------------------------------
+
+_INT64_MIN = -(1 << 63)
+_INT64_MAX = (1 << 63) - 1
+
+_STH_SHAPE: dict[str, Any] = {
+    "treeSize": "integer",
+    "timestamp": "string",
+    "rootHash": "string",
+    "signedBy": "string",
+    "signature": "string",
+}
+_TRUST_PROOF_SHAPE: dict[str, Any] = {
+    "did": "string",
+    "trustLevel": "integer",
+    "trustScore": "number",
+    "verdict": "string",
+    "issuedAt": "string",
+    "expiresAt": "string",
+    "issuerDid": "string",
+    "signatures": [{"keyId": "string", "algorithm": "string", "value": "string"}],
+    "transparencyLogIndex": "?integer",
+}
+_DISCOVERY_SHAPE: dict[str, Any] = {
+    "authorityDid": "string",
+    "version": "string",
+    "conformanceLevel": "integer",
+    "endpoints": {"*": "string"},
+    "publicKeys": [
+        {
+            "keyId": "string",
+            "algorithm": "string",
+            "publicKeyHex": "string",
+            "status": "string",
+            "validFrom": "string",
+        }
+    ],
+    "supportedMethods": ["string"],
+    "capabilities": ["string"],
+}
+_INCLUSION_PROOF_SHAPE: dict[str, Any] = {
+    "logIndex": "integer",
+    "leafHash": "string",
+    "auditPath": ["string"],
+    "signedTreeHead": _STH_SHAPE,
+}
+_CONSISTENCY_PROOF_SHAPE: dict[str, Any] = {
+    "fromSize": "integer",
+    "toSize": "integer",
+    "consistencyPath": ["string"],
+    "fromSignedTreeHead": _STH_SHAPE,
+    "toSignedTreeHead": _STH_SHAPE,
+}
+_REVOCATION_LIST_SHAPE: dict[str, Any] = {
+    "revocations": [
+        {
+            "agentDid": "string",
+            "revokedAt": "string",
+            "reason": "string",
+            "transparencyLogIndex": "?integer",
+            "revokedByKeyId": "string",
+        }
+    ],
+    "nextSince": "string",
+}
+
+
+class ShapeError(ValueError):
+    """A wire value whose JSON type or range does not fit its member's shape."""
+
+
+def _json_kind(value: Any) -> str:
+    """The JSON type of a decoded value, with the literal for numbers, in the
+    words the Go verifier's decode error uses."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, (int, float)):
+        return f"number {json.dumps(value)}"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    return "object"
+
+
+def _absent(shape: Any) -> Any:
+    """What a member absent from its object decodes to: the Go zero value of
+    its shape, or None for an optional integer and a nested object (a nil
+    pointer in the Go verifier)."""
+    if isinstance(shape, str):
+        return {"string": "", "integer": 0, "?integer": None, "number": 0.0}[shape]
+    if isinstance(shape, list):
+        return []
+    if "*" in shape:
+        return {}
+    return None
+
+
+def _null_error(label: str, shape: Any) -> ShapeError:
+    """The type violation for a JSON null where shape does not take one."""
+    if isinstance(shape, str):
+        word = shape.lstrip("?")
+    elif isinstance(shape, list):
+        word = "array"
+    else:
+        word = "object"
+    return ShapeError(f"{label}: JSON null does not fit the {word} the schema requires")
+
+
+def _decode(label: str, value: Any, shape: Any) -> Any:
+    """Decode one wire value against its shape the way the Go verifier
+    decodes it. Raises ShapeError naming the member."""
+    if value is None:
+        if shape == "?integer" or (isinstance(shape, dict) and "*" not in shape):
+            return None
+        raise _null_error(label, shape)
+    if isinstance(shape, str):
+        kind = shape.lstrip("?")
+        if kind == "string":
+            if isinstance(value, str):
+                return value
+        elif kind == "integer":
+            if isinstance(value, int) and not isinstance(value, bool) and _INT64_MIN <= value <= _INT64_MAX:
+                return value
+        elif kind == "number":
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                try:
+                    number = float(value)
+                except OverflowError:
+                    number = math.inf
+                if math.isfinite(number):
+                    return number
+        raise ShapeError(f"{label}: JSON {_json_kind(value)} does not fit the {kind} the schema requires")
+    # An array element or an object value is never optional, so a null one is
+    # a type violation even where its shape is a nested object.
+    if isinstance(shape, list):
+        if not isinstance(value, list):
+            raise ShapeError(f"{label}: JSON {_json_kind(value)} does not fit the array the schema requires")
+        decoded = []
+        for i, item in enumerate(value):
+            if item is None:
+                raise _null_error(f"{label}[{i}]", shape[0])
+            decoded.append(_decode(f"{label}[{i}]", item, shape[0]))
+        return decoded
+    if "*" in shape:
+        if not isinstance(value, dict):
+            raise ShapeError(f"{label}: JSON {_json_kind(value)} does not fit the object the schema requires")
+        decoded_values = {}
+        for key, item in value.items():
+            if item is None:
+                raise _null_error(f"{label}.{key}", shape["*"])
+            decoded_values[key] = _decode(f"{label}.{key}", item, shape["*"])
+        return decoded_values
+    if not isinstance(value, dict):
+        raise ShapeError(f"{label}: JSON {_json_kind(value)} does not fit the object the schema requires")
+    return {
+        key: _decode(f"{label}.{key}", value[key], sub) if key in value else _absent(sub)
+        for key, sub in shape.items()
+    }
+
+
+# ---------------------------------------------------------------------------
 # per-type verifiers
 # ---------------------------------------------------------------------------
 
 def verify_discovery(fixture: dict[str, Any]) -> VerifyResult:
-    d = fixture.get("discoveryResponse")
-    if not d:
+    try:
+        d = _decode("discoveryResponse", fixture.get("discoveryResponse"), _DISCOVERY_SHAPE)
+    except ShapeError as exc:
+        return VerifyResult(reject_category="PARSE_ERROR", reason=str(exc))
+    if d is None:
         return VerifyResult(reject_category="PARSE_ERROR", reason="discoveryResponse missing")
 
-    if not d.get("authorityDid"):
+    if not d["authorityDid"]:
         return VerifyResult(reject_category="DISCOVERY_INVALID", reason="authorityDid missing")
-    if not d.get("version"):
+    if not d["version"]:
         return VerifyResult(reject_category="DISCOVERY_INVALID", reason="version missing")
     if d["version"] != SUPPORTED_VERSION:
         return VerifyResult(
             reject_category="UNSUPPORTED_VERSION",
             reason=f"unsupported atp version {d['version']!r} (this verifier supports {SUPPORTED_VERSION})",
         )
-    cl = d.get("conformanceLevel", 0)
+    cl = d["conformanceLevel"]
     if not (1 <= cl <= 3):
         return VerifyResult(reject_category="DISCOVERY_INVALID", reason=f"conformanceLevel {cl} out of range [1,3]")
-    if not d.get("endpoints"):
+    if not d["endpoints"]:
         return VerifyResult(reject_category="DISCOVERY_INVALID", reason="endpoints missing")
-    if not d.get("publicKeys"):
+    if not d["publicKeys"]:
         return VerifyResult(reject_category="DISCOVERY_INVALID", reason="publicKeys missing")
 
     vs = fixture["verifierState"]
@@ -147,7 +354,7 @@ def verify_discovery(fixture: dict[str, Any]) -> VerifyResult:
         )
 
     for i, pk in enumerate(d["publicKeys"]):
-        algo = pk.get("algorithm")
+        algo = pk["algorithm"]
         if algo == "Ed25519":
             try:
                 raw = bytes.fromhex(pk["publicKeyHex"])
@@ -176,19 +383,32 @@ def verify_discovery(fixture: dict[str, Any]) -> VerifyResult:
                 reject_category="DISCOVERY_INVALID",
                 reason=f"publicKeys[{i}] unsupported algorithm {algo!r}",
             )
-        if pk.get("status") not in VALID_KEY_STATUS:
+        if pk["status"] not in VALID_KEY_STATUS:
             return VerifyResult(
                 reject_category="DISCOVERY_INVALID",
-                reason=f"publicKeys[{i}] status {pk.get('status')!r} not in {sorted(VALID_KEY_STATUS)}",
+                reason=f"publicKeys[{i}] status {pk['status']!r} not in {sorted(VALID_KEY_STATUS)}",
             )
 
     return VerifyResult(accepted=True)
 
 
 def verify_trust_proof(fixture: dict[str, Any]) -> VerifyResult:
-    tp = fixture.get("trustProof")
-    if not tp:
+    try:
+        tp = _decode("trustProof", fixture.get("trustProof"), _TRUST_PROOF_SHAPE)
+    except ShapeError as exc:
+        return VerifyResult(reject_category="PARSE_ERROR", reason=str(exc))
+    if tp is None:
         return VerifyResult(reject_category="PARSE_ERROR", reason="trustProof missing")
+    # transparencyLogIndex sits outside the §4.3 signed form and is not read
+    # here, but the schema says integer, minimum 0: a negative index is a
+    # malformed proof, not a proof to verify. The member is optional, so an
+    # absent or null index is not checked.
+    log_index = tp["transparencyLogIndex"]
+    if log_index is not None and log_index < 0:
+        return VerifyResult(
+            reject_category="PARSE_ERROR",
+            reason=f"trustProof.transparencyLogIndex {log_index} must be >= 0",
+        )
     vs = fixture["verifierState"]
     now = datetime.fromisoformat(vs["clockRfc3339"].replace("Z", "+00:00")).astimezone(timezone.utc)
 
@@ -211,10 +431,10 @@ def verify_trust_proof(fixture: dict[str, Any]) -> VerifyResult:
         )
 
     # Step 5 semantic.
-    tl = int(tp["trustLevel"])
+    tl = tp["trustLevel"]
     if not (0 <= tl <= 4):
         return VerifyResult(reject_category="SEMANTIC_INVALID", reason=f"trustLevel {tl} out of range [0,4]")
-    ts = float(tp["trustScore"])
+    ts = tp["trustScore"]
     if not (0.0 <= ts <= 1.0):
         return VerifyResult(reject_category="SEMANTIC_INVALID", reason=f"trustScore {ts:.6f} out of range [0.0,1.0]")
     if tp["verdict"] not in VALID_VERDICTS:
@@ -234,9 +454,9 @@ def verify_trust_proof(fixture: dict[str, Any]) -> VerifyResult:
     # Steps 3-4: signature.
     payload = canonical_proof_payload(tp)
     eds, _ = index_public_keys(vs["publicKeys"])
-    result = VerifyResult(sigs_expected=len(tp.get("signatures", [])))
+    result = VerifyResult(sigs_expected=len(tp["signatures"]))
 
-    for sig in tp.get("signatures", []):
+    for sig in tp["signatures"]:
         try:
             sig_bytes = base64.b64decode(sig["value"])
         except Exception as exc:
@@ -278,20 +498,23 @@ def verify_trust_proof(fixture: dict[str, Any]) -> VerifyResult:
 
 
 def verify_sth(fixture: dict[str, Any]) -> VerifyResult:
-    sth = fixture.get("signedTreeHead")
-    if not sth:
+    try:
+        sth = _decode("signedTreeHead", fixture.get("signedTreeHead"), _STH_SHAPE)
+    except ShapeError as exc:
+        return VerifyResult(reject_category="PARSE_ERROR", reason=str(exc))
+    if sth is None:
         return VerifyResult(reject_category="PARSE_ERROR", reason="signedTreeHead missing")
     vs = fixture["verifierState"]
 
-    if int(sth.get("treeSize", 0)) <= 0:
-        return VerifyResult(reject_category="STH_INVALID", reason=f"treeSize {sth.get('treeSize')} must be > 0")
+    if sth["treeSize"] <= 0:
+        return VerifyResult(reject_category="STH_INVALID", reason=f"treeSize {sth['treeSize']} must be > 0")
     try:
         datetime.fromisoformat(sth["timestamp"].replace("Z", "+00:00"))
-    except (KeyError, ValueError) as exc:
+    except ValueError as exc:
         return VerifyResult(reject_category="STH_INVALID", reason=f"bad timestamp: {exc}")
     try:
         root_bytes = sth_signed_bytes(sth["rootHash"])
-    except (KeyError, ValueError) as exc:
+    except ValueError as exc:
         return VerifyResult(reject_category="STH_INVALID", reason=str(exc))
     try:
         sig_bytes = base64.b64decode(sth["signature"])
@@ -386,18 +609,19 @@ def _verify_merkle_consistency(from_size: int, to_size: int, path: list[bytes], 
 def _check_embedded_sth(label: str, sth: dict[str, Any] | None, keys: list[dict[str, Any]]) -> tuple[str, str]:
     """Validates a tree head embedded in a §5.4/§5.5 payload — same rules as
     verify_sth, factored so the proof verifiers stay behaviorally identical.
+    sth is the head as _decode returns it (None when absent or null).
     Returns (category, reason); empty category means the head verifies."""
-    if not sth:
+    if sth is None:
         return ("PARSE_ERROR", f"{label} missing")
-    if int(sth.get("treeSize", 0)) <= 0:
-        return ("STH_INVALID", f"{label}.treeSize {sth.get('treeSize')} must be > 0")
+    if sth["treeSize"] <= 0:
+        return ("STH_INVALID", f"{label}.treeSize {sth['treeSize']} must be > 0")
     try:
         datetime.fromisoformat(sth["timestamp"].replace("Z", "+00:00"))
-    except (KeyError, ValueError) as exc:
+    except ValueError as exc:
         return ("STH_INVALID", f"{label} bad timestamp: {exc}")
     try:
         root_bytes = sth_signed_bytes(sth["rootHash"])
-    except (KeyError, ValueError) as exc:
+    except ValueError as exc:
         return ("STH_INVALID", f"{label}: {exc}")
     try:
         sig_bytes = base64.b64decode(sth["signature"])
@@ -416,17 +640,20 @@ def _check_embedded_sth(label: str, sth: dict[str, Any] | None, keys: list[dict[
 def verify_inclusion_proof(fixture: dict[str, Any]) -> VerifyResult:
     """ATP §5.4: embedded tree head per §5.6, then RFC 9162 §2.1.3.2
     recomputation from leafHash along auditPath must reproduce sth.rootHash."""
-    ip = fixture.get("inclusionProof")
-    if not ip:
+    try:
+        ip = _decode("inclusionProof", fixture.get("inclusionProof"), _INCLUSION_PROOF_SHAPE)
+    except ShapeError as exc:
+        return VerifyResult(reject_category="PARSE_ERROR", reason=str(exc))
+    if ip is None:
         return VerifyResult(reject_category="PARSE_ERROR", reason="inclusionProof missing")
     vs = fixture["verifierState"]
 
     try:
         leaf = _wire_hash_bytes(ip["leafHash"])
-        path = [_wire_hash_bytes(p) for p in ip.get("auditPath", [])]
-    except (KeyError, ValueError) as exc:
+        path = [_wire_hash_bytes(p) for p in ip["auditPath"]]
+    except ValueError as exc:
         return VerifyResult(reject_category="PARSE_ERROR", reason=str(exc))
-    sth = ip.get("signedTreeHead")
+    sth = ip["signedTreeHead"]
     cat, reason = _check_embedded_sth("signedTreeHead", sth, vs["publicKeys"])
     if cat:
         return VerifyResult(reject_category=cat, reason=reason)
@@ -434,8 +661,8 @@ def verify_inclusion_proof(fixture: dict[str, Any]) -> VerifyResult:
         root = _wire_hash_bytes(sth["rootHash"])
     except ValueError as exc:
         return VerifyResult(reject_category="PARSE_ERROR", reason=str(exc))
-    log_index = int(ip.get("logIndex", -1))
-    tree_size = int(sth["treeSize"])
+    log_index = ip["logIndex"]
+    tree_size = sth["treeSize"]
     if log_index < 0 or log_index >= tree_size:
         return VerifyResult(reject_category="PARSE_ERROR", reason=f"logIndex {log_index} out of range for treeSize {tree_size}")
     if not _verify_merkle_inclusion(log_index, tree_size, leaf, path, root):
@@ -446,23 +673,26 @@ def verify_inclusion_proof(fixture: dict[str, Any]) -> VerifyResult:
 def verify_consistency_proof(fixture: dict[str, Any]) -> VerifyResult:
     """ATP §5.5: both embedded tree heads per §5.6, then RFC 9162 §2.1.4.2
     must reproduce both roots."""
-    cp = fixture.get("consistencyProof")
-    if not cp:
+    try:
+        cp = _decode("consistencyProof", fixture.get("consistencyProof"), _CONSISTENCY_PROOF_SHAPE)
+    except ShapeError as exc:
+        return VerifyResult(reject_category="PARSE_ERROR", reason=str(exc))
+    if cp is None:
         return VerifyResult(reject_category="PARSE_ERROR", reason="consistencyProof missing")
     vs = fixture["verifierState"]
 
-    from_sth = cp.get("fromSignedTreeHead")
-    to_sth = cp.get("toSignedTreeHead")
-    if not from_sth or not to_sth:
+    from_sth = cp["fromSignedTreeHead"]
+    to_sth = cp["toSignedTreeHead"]
+    if from_sth is None or to_sth is None:
         return VerifyResult(reject_category="PARSE_ERROR", reason="fromSignedTreeHead/toSignedTreeHead missing")
-    from_size = int(cp.get("fromSize", -1))
-    to_size = int(cp.get("toSize", -1))
-    if from_size != int(from_sth.get("treeSize", -2)) or to_size != int(to_sth.get("treeSize", -2)):
+    from_size = cp["fromSize"]
+    to_size = cp["toSize"]
+    if from_size != from_sth["treeSize"] or to_size != to_sth["treeSize"]:
         return VerifyResult(reject_category="PARSE_ERROR", reason="fromSize/toSize must equal the embedded tree heads' treeSize values")
     if from_size >= to_size:
         return VerifyResult(reject_category="PARSE_ERROR", reason=f"fromSize {from_size} must be < toSize {to_size}")
     try:
-        path = [_wire_hash_bytes(p) for p in cp.get("consistencyPath", [])]
+        path = [_wire_hash_bytes(p) for p in cp["consistencyPath"]]
     except ValueError as exc:
         return VerifyResult(reject_category="PARSE_ERROR", reason=str(exc))
     for label, sth in (("fromSignedTreeHead", from_sth), ("toSignedTreeHead", to_sth)):
@@ -483,8 +713,11 @@ def verify_revocation_list(fixture: dict[str, Any]) -> VerifyResult:
     """ATP §8.1: structural verification of the unsigned revocation body. A
     malformed timestamp rejects the WHOLE response — skipping unparseable
     entries keeps a revoked agent trusted."""
-    rl = fixture.get("revocationList")
-    if not rl:
+    try:
+        rl = _decode("revocationList", fixture.get("revocationList"), _REVOCATION_LIST_SHAPE)
+    except ShapeError as exc:
+        return VerifyResult(reject_category="PARSE_ERROR", reason=str(exc))
+    if rl is None:
         return VerifyResult(reject_category="PARSE_ERROR", reason="revocationList missing")
 
     def _parse_rfc3339_strict(value: str) -> None:
@@ -497,29 +730,29 @@ def verify_revocation_list(fixture: dict[str, Any]) -> VerifyResult:
         if dt.tzinfo is None:
             raise ValueError("missing zone designator")
 
-    next_since = rl.get("nextSince")
+    next_since = rl["nextSince"]
     if not next_since:
         return VerifyResult(reject_category="PARSE_ERROR", reason="nextSince missing")
     try:
-        _parse_rfc3339_strict(str(next_since))
+        _parse_rfc3339_strict(next_since)
     except ValueError as exc:
         return VerifyResult(reject_category="PARSE_ERROR", reason=f"nextSince is not RFC 3339: {exc}")
-    for i, entry in enumerate(rl.get("revocations", [])):
-        agent_did = entry.get("agentDid", "")
+    for i, entry in enumerate(rl["revocations"]):
+        agent_did = entry["agentDid"]
         if not agent_did.startswith("did:"):
             return VerifyResult(reject_category="PARSE_ERROR", reason=f"revocations[{i}].agentDid {agent_did!r} is not a DID")
         try:
-            _parse_rfc3339_strict(str(entry["revokedAt"]))
-        except (KeyError, ValueError) as exc:
+            _parse_rfc3339_strict(entry["revokedAt"])
+        except ValueError as exc:
             return VerifyResult(reject_category="PARSE_ERROR", reason=f"revocations[{i}].revokedAt is not RFC 3339: {exc}")
-        if not entry.get("reason"):
+        if not entry["reason"]:
             return VerifyResult(reject_category="PARSE_ERROR", reason=f"revocations[{i}].reason missing")
         # transparencyLogIndex is optional: an absent (or null) index does not
         # reject the entry or the response. A present index must be >= 0.
-        log_index = entry.get("transparencyLogIndex")
-        if log_index is not None and int(log_index) < 0:
+        log_index = entry["transparencyLogIndex"]
+        if log_index is not None and log_index < 0:
             return VerifyResult(reject_category="PARSE_ERROR", reason=f"revocations[{i}].transparencyLogIndex must be >= 0")
-        if "#" not in entry.get("revokedByKeyId", ""):
+        if "#" not in entry["revokedByKeyId"]:
             return VerifyResult(reject_category="PARSE_ERROR", reason=f"revocations[{i}].revokedByKeyId is not fragment-qualified")
     return VerifyResult(accepted=True)
 
@@ -560,11 +793,24 @@ def _verify_fixture(fixture: dict[str, Any]) -> VerifyResult:
     return VerifyResult(reject_category="PARSE_ERROR", reason=f"unknown fixtureType {ft!r}")
 
 
-def load_fixture(path: Path) -> dict[str, Any]:
-    fixture = json.loads(path.read_text())
+def _reject_non_finite(literal: str) -> Any:
+    # json.loads would otherwise read the NaN, Infinity and -Infinity
+    # extensions, which the JSON grammar and the Go verifier's decoder refuse.
+    raise ValueError(f"{literal} is not a JSON value")
+
+
+def parse_fixture(text: str) -> dict[str, Any]:
+    """Parses a fixture document with the Go verifier's acceptance: the
+    document must be a JSON object and may not use the NaN / Infinity
+    extensions. A document this refuses is a load error, not a verdict."""
+    fixture = json.loads(text, parse_constant=_reject_non_finite)
     if not isinstance(fixture, dict):
         raise ValueError(f"top-level JSON value is {type(fixture).__name__}, not an object")
     return fixture
+
+
+def load_fixture(path: Path) -> dict[str, Any]:
+    return parse_fixture(path.read_text())
 
 
 def expand_paths(args: list[str]) -> list[Path]:

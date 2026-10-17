@@ -92,6 +92,42 @@ fixture-level verifier behavior in this repository, which configures
 trusted authorities directly from each fixture rather than resolving them
 over the network.
 
+### Wire types: both verifiers decode before they verify
+
+Each payload member is decoded against the JSON type the vendored schema
+gives it before the verification steps run, and a member that does not fit
+is `REJECT[PARSE_ERROR]` naming the member. The reading is the Go
+verifier's `encoding/json` decode, mirrored member for member by the shape
+tables and `_decode` in [`verifiers/python/verify.py`](../verifiers/python/verify.py):
+
+- an `integer` member is a JSON number written without fraction or
+  exponent that fits a signed 64-bit integer, so `"5"`, `true`,
+  `1847300.0`, `1e3`, `-0.5` and `9223372036854775808` are rejected
+  where the schema says integer;
+- a `number` member (`trustScore`) is a JSON number that fits a binary64
+  float, so `"0.825"` is rejected;
+- a `string` member is a JSON string, so `1` for `reason` and `["#"]` for
+  `revokedByKeyId` are rejected;
+- `null` is a value of no schema type, so a `null` member, array element
+  or object value is rejected the same way, where `encoding/json` alone
+  would decode it to the zero value: `revocations: null` is a malformed
+  response, not an empty revocation list, and `logIndex: null` is not
+  leaf 0. Two kinds of member take `null` as absent: the optional
+  `transparencyLogIndex` on a §8.1 revocation entry and on a trust proof,
+  which is then not checked (a present index must be `>= 0`), and an
+  embedded payload or tree head object, which the steps then report as
+  missing, also `PARSE_ERROR`;
+- an absent member decodes to the zero value (`""`, `0`, an empty array)
+  and the verification steps then judge it.
+
+This is stricter than JSON Schema 2020-12, which reads `1.0` as an integer
+and puts no upper bound on one. The suite pins the stricter reading so the
+two verifiers return the same verdict for inputs outside the committed
+fixture set. The regression tables in
+[`verifiers/go/verify_test.go`](../verifiers/go/verify_test.go) and
+[`verifiers/python/test_verify.py`](../verifiers/python/test_verify.py)
+hold the same cases for both verifiers.
+
 ## The fixture generator
 
 The README's [Reproducing the fixtures](../README.md#reproducing-the-fixtures)

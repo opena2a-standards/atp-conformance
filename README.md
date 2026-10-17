@@ -58,6 +58,11 @@ To additionally assert the two verifiers agree with each other per fixture
 python3 scripts/parity/parity.py
 ```
 
+Both verifiers decode each payload member against the JSON type the
+vendored schema gives it before verifying, so a member of the wrong type
+or range is `REJECT[PARSE_ERROR]` in both; the rule is in
+[docs/how-it-works.md](docs/how-it-works.md#wire-types-both-verifiers-decode-before-they-verify).
+
 ## Scope
 
 What this suite verifies, as 17 ATP items each mapped to its fixtures:
