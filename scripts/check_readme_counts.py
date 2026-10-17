@@ -2,11 +2,19 @@
 """Assert the fixture counts stated in README.md, and the per-fixture table in
 docs/fixtures.md, match the fixture set.
 
-The README states the expected verifier result in two places: the continuous
-verification list ("N pass, 0 fail") and the implementations table ("N / N
-PASS"). Both are measurements over fixtures/, so they are enforced here
-rather than maintained by hand. Both drifted once already: the list claimed
-7 pass and the table claimed 4 / 4 after the fixture set had grown to 13.
+The README states the expected verifier result in four places: the summary
+under "Running the verifiers" ("summary: N pass, 0 fail (N fixtures)" and
+the "(A ACCEPT, R REJECT)" split after it), the continuous verification list
+("N pass, 0 fail"), the implementations table ("N / N PASS") and the cosigner
+example ("go=N pass, 0 fail; python=N pass, 0 fail"). All are measurements
+over fixtures/, so they are enforced here rather than maintained by hand:
+every "N pass, M fail" needs N equal to the fixture count and M equal to 0,
+every "(N fixtures)" and "N / N PASS" needs N equal to the fixture count, and
+the ACCEPT/REJECT split must equal the verifyResult counts in the fixtures'
+expected blocks. Each of these four claim shapes must appear at least once,
+and a mismatch names its README line. The list and the table drifted once
+already: the list claimed 7 pass and the table claimed 4 / 4 after the
+fixture set had grown to 13.
 
 The fixture reference the README links (docs/fixtures.md) has a Fixtures
 table with one row per fixture. It listed only the original four fixtures
@@ -32,34 +40,73 @@ FIXTURES = ROOT / "fixtures"
 FIXTURE_TABLE_HEADER = ["Fixture", "Type", "Expected", "Exercises"]
 
 
-def readme_failures(actual):
+def readme_failures(outcomes):
+    """Failures for the README count claims. `outcomes` holds the
+    expected.verifyResult of each fixture in fixtures/."""
     readme = README.read_text(encoding="utf-8")
+    actual = len(outcomes)
+    accept = outcomes.count("ACCEPT")
+    reject = outcomes.count("REJECT")
     failures = []
 
-    # "must report `20 pass, 0 fail`" in the continuous-verification list.
-    pass_fail = re.findall(r"`(\d+) pass, (\d+) fail`", readme)
+    def claims(pattern):
+        """(README line, groups) for each match. The patterns match across
+        whitespace, so a claim that rewrapping splits over two lines is still
+        read; the line is the one the claim starts on."""
+        return [
+            (f"{README.name}:{readme.count(chr(10), 0, m.start()) + 1}", m.groups())
+            for m in re.finditer(pattern, readme)
+        ]
+
+    # "summary: 20 pass, 0 fail" under Running the verifiers, "`20 pass, 0
+    # fail`" in the continuous-verification list, and the cosigner example
+    # "go=20 pass, 0 fail; python=20 pass, 0 fail".
+    pass_fail = claims(r"\b(\d+)\s+pass,\s+(\d+)\s+fail\b")
     if not pass_fail:
         failures.append("no `N pass, 0 fail` claim found in README")
-    for stated, failed in pass_fail:
+    for where, (stated, failed) in pass_fail:
         if int(stated) != actual:
             failures.append(
-                f"README claims `{stated} pass` but fixtures/ holds {actual}"
+                f"{where}: README claims `{stated} pass` but fixtures/ holds {actual}"
             )
         if int(failed) != 0:
-            failures.append(f"README claims `{failed} fail`, expected 0")
+            failures.append(f"{where}: README claims `{failed} fail`, expected 0")
+
+    # "(20 fixtures)" after the summary.
+    fixture_count = claims(r"\((\d+)\s+fixtures\)")
+    if not fixture_count:
+        failures.append("no `(N fixtures)` claim found in README")
+    for where, (stated,) in fixture_count:
+        if int(stated) != actual:
+            failures.append(
+                f"{where}: README claims {stated} fixtures but fixtures/ holds {actual}"
+            )
+
+    # "(10 ACCEPT, 10 REJECT)", the split of the shipped fixture set.
+    split = claims(r"\((\d+)\s+ACCEPT,\s+(\d+)\s+REJECT\)")
+    if not split:
+        failures.append("no `(N ACCEPT, M REJECT)` claim found in README")
+    for where, (stated_accept, stated_reject) in split:
+        if (int(stated_accept), int(stated_reject)) != (accept, reject):
+            failures.append(
+                f"{where}: README claims {stated_accept} ACCEPT, {stated_reject} REJECT "
+                f"but the fixtures' expected blocks hold {accept} ACCEPT, {reject} REJECT"
+            )
 
     # "20 / 20 PASS" rows in the implementations table.
-    table = re.findall(r"(\d+)\s*/\s*(\d+)\s+PASS", readme)
+    table = claims(r"(\d+)\s*/\s*(\d+)\s+PASS")
     if not table:
         failures.append("no `N / N PASS` row found in README")
-    for got, total in table:
+    for where, (got, total) in table:
         if int(total) != actual:
             failures.append(
-                f"README implementations table claims {got} / {total} PASS "
+                f"{where}: README implementations table claims {got} / {total} PASS "
                 f"but fixtures/ holds {actual}"
             )
         if got != total:
-            failures.append(f"README table row {got} / {total} PASS is not a full pass")
+            failures.append(
+                f"{where}: README table row {got} / {total} PASS is not a full pass"
+            )
 
     return failures
 
@@ -144,14 +191,22 @@ def main():
         print("no fixtures found; refusing to pass vacuously", file=sys.stderr)
         return 1
 
-    failures = readme_failures(actual) + fixture_table_failures(paths)
+    outcomes = [
+        json.loads(path.read_text(encoding="utf-8"))["expected"]["verifyResult"]
+        for path in paths
+    ]
+    failures = readme_failures(outcomes) + fixture_table_failures(paths)
     if failures:
         print("README.md or docs/fixtures.md does not match fixtures/:\n", file=sys.stderr)
         for f in failures:
             print(f"  - {f}", file=sys.stderr)
         return 1
 
-    print(f"README counts match fixtures/: {actual} fixtures, all stated as passing")
+    print(
+        f"README counts match fixtures/: {actual} fixtures "
+        f"({outcomes.count('ACCEPT')} ACCEPT, {outcomes.count('REJECT')} REJECT), "
+        "all stated as passing"
+    )
     print(
         f"docs/fixtures.md Fixtures table: one row for each of the {actual} fixtures, "
         "Type and Expected matching"
