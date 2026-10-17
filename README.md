@@ -75,6 +75,8 @@ What this suite does NOT verify (v0.3):
   authority to source a real cosigned proof from.
 - §8.1 response authenticity. The spec does not sign the revocation body;
   the fixtures cover the structural rules only.
+- §8.1 entries without a `transparencyLogIndex`, which ATP §8.1 makes
+  optional. No fixture carries one yet.
 
 Each item in full: [docs/fixtures.md](docs/fixtures.md#what-this-suite-does-not-verify-v03).
 

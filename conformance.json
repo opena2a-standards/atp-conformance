@@ -27,7 +27,11 @@
     },
     {
       "specSection": "§8.1 response authenticity",
-      "reason": "the spec does not sign the revocation body (transport + per-entry transparencyLogIndex carry authenticity); the fixtures cover the structural rules only"
+      "reason": "the spec does not sign the revocation body (the transport carries authenticity, plus the transparencyLogIndex of an entry that carries one; an entry without it rests on the transport alone); the fixtures cover the structural rules only"
+    },
+    {
+      "specSection": "§8.1 entries without a transparencyLogIndex",
+      "reason": "§8.1 makes transparencyLogIndex OPTIONAL and a client MUST apply an entry without it; no fixture carries such an entry yet"
     }
   ],
   "requirements": [
