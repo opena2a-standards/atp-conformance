@@ -14,6 +14,13 @@ script makes the cross-implementation agreement explicit and machine-readable:
 it fails if any verifier skips a fixture the other saw, disagrees on verdict
 or category, or exits non-zero.
 
+The Go verifier also runs a second time with no arguments (`go-builtin`),
+the way `go run github.com/opena2a-standards/atp-conformance/verifiers/go@latest`
+runs it: over the fixture set built into the binary, verifiers/go/fixtures/.
+That run is held to the same agreement, and the script fails unless
+verifiers/go/fixtures/ holds the same *.json files as fixtures/, byte for
+byte, so the published command verifies the bytes MANIFEST.sha256 pins.
+
 Known, documented asymmetry: the Go verifier validates ML-DSA-65 signatures;
 the Python verifier records them as present and validates Ed25519 only. That
 asymmetry lives below the verdict level, so it does not (and must not) show
@@ -34,11 +41,19 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+FIXTURES = REPO_ROOT / "fixtures"
+# The copy of fixtures/ the Go verifier builds in and a run with no
+# arguments verifies.
+BUILTIN_COPY = REPO_ROOT / "verifiers" / "go" / "fixtures"
 
 VERIFIERS = {
     "go": {
         "cwd": REPO_ROOT / "verifiers" / "go",
         "cmd": ["go", "run", ".", "../../fixtures"],
+    },
+    "go-builtin": {
+        "cwd": REPO_ROOT / "verifiers" / "go",
+        "cmd": ["go", "run", "."],
     },
     "python": {
         "cwd": REPO_ROOT / "verifiers" / "python",
@@ -80,12 +95,37 @@ def run_verifier(name: str, spec: dict) -> tuple[int, dict[str, dict]]:
     return proc.returncode, records
 
 
+def _shown(path: Path) -> str:
+    """`path` relative to the repository root when it is inside it."""
+    try:
+        return str(path.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
+
+
+def builtin_copy_divergences(fixtures: Path, copy: Path) -> list[str]:
+    """Each *.json file the copy is missing, has extra, or holds with
+    different bytes, compared with `fixtures`, with the command that fixes it."""
+    want = {p.name: p.read_bytes() for p in fixtures.glob("*.json")}
+    have = {p.name: p.read_bytes() for p in copy.glob("*.json")}
+    src, dst = _shown(fixtures), _shown(copy)
+    out = []
+    for name in sorted(want.keys() | have.keys()):
+        if name not in have:
+            out.append(f"{dst}/{name} is missing (fix: cp {src}/{name} {dst}/)")
+        elif name not in want:
+            out.append(f"{dst}/{name} is not in {src}/ (fix: git rm {dst}/{name})")
+        elif have[name] != want[name]:
+            out.append(f"{dst}/{name} differs from {src}/{name} (fix: cp {src}/{name} {dst}/)")
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--json", metavar="PATH", help="write a JSON parity report")
     args = ap.parse_args()
 
-    fixture_files = sorted(p.name for p in (REPO_ROOT / "fixtures").glob("*.json"))
+    fixture_files = sorted(p.name for p in FIXTURES.glob("*.json"))
     if not fixture_files:
         sys.stderr.write("[parity] no fixtures found\n")
         return 1
@@ -97,7 +137,7 @@ def main() -> int:
         exit_codes[name] = code
         results[name] = records
 
-    divergences: list[str] = []
+    divergences: list[str] = builtin_copy_divergences(FIXTURES, BUILTIN_COPY)
 
     for name, code in exit_codes.items():
         if code != 0:
@@ -123,7 +163,7 @@ def main() -> int:
             if len(set(vals.values())) > 1:
                 divergences.append(f"{fx}: {field} divergence {vals}")
 
-    print(f"parity: {len(fixture_files)} fixtures x {len(names)} verifiers")
+    print(f"parity: {len(fixture_files)} fixtures x {len(names)} verifier runs")
     for fx, row in table.items():
         cells = []
         for n in names:

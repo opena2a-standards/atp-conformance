@@ -152,6 +152,14 @@ The generator:
 8. Writes the fixture file. Recomputes its SHA-256. Updates
    `MANIFEST.sha256` in path-sorted order.
 
+The Go verifier builds in a copy of `fixtures/`, `verifiers/go/fixtures/`,
+so `go run github.com/opena2a-standards/atp-conformance/verifiers/go@latest`
+verifies the suite with no clone. The generator does not write that copy:
+CI runs the generator before the parity gate, so a copy it rewrote there
+could no longer show that the committed copy had gone stale. After a
+regeneration that changes `fixtures/`, copy the changed files across; the
+parity gate names each file that differs and the command that fixes it.
+
 ## Repository layout
 
 ```
@@ -162,6 +170,7 @@ COSIGNERS.md                     second-party cosigner registry
 fixtures/                        the 14 conformance fixtures (byte-stable JSON)
 vectors/                         test keypair vectors (TEST-ONLY)
 verifiers/go/                    Go reference verifier (full hybrid)
+verifiers/go/fixtures/           byte copy of fixtures/ built into the Go verifier
 verifiers/python/                Python reference verifier (Ed25519)
 scripts/generate-fixtures/       deterministic fixture generator (Go)
 ```

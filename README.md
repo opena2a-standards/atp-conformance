@@ -12,17 +12,31 @@ report PASS or FAIL per vector. Fixture bytes are pinned in
 
 ## Running the verifiers
 
-### Go (full hybrid Ed25519 plus ML-DSA-65)
+With Go 1.22 or later, one command fetches the Go verifier (full hybrid
+Ed25519 plus ML-DSA-65) and runs it over the fixture set built into it. No
+clone is needed:
+
+```bash
+go run github.com/opena2a-standards/atp-conformance/verifiers/go@latest
+```
+
+That command, and both verifiers run from a clone, report
+`summary: 14 pass, 0 fail (14 fixtures)` against the shipped
+fixture set (7 ACCEPT, 7 REJECT). Any divergence on bytes (the
+fixture file was modified) or on verifier semantics (the verifier has
+drifted from the spec) shows up as one or more FAIL lines.
+
+The built-in set is [`verifiers/go/fixtures/`](./verifiers/go/fixtures), a
+byte copy of `fixtures/` that the parity gate holds equal. The verifier's
+first line of output names the module version the command fetched. Pass
+fixture files or a directory as arguments to verify those instead.
+
+### Go from a clone (full hybrid Ed25519 plus ML-DSA-65)
 
 ```bash
 cd verifiers/go
 go run . ../../fixtures
 ```
-
-Both verifiers report `summary: 14 pass, 0 fail (14 fixtures)` against the
-shipped fixture set (7 ACCEPT, 7 REJECT). Any divergence on bytes (the
-fixture file was modified) or on verifier semantics (the verifier has
-drifted from the spec) shows up as one or more FAIL lines.
 
 Both verifiers walk every `*.json` file in the directory you point them at
 (or you may pass individual fixture files). Exit code is 0 if every
@@ -34,7 +48,7 @@ Depends on:
 - Go 1.22 or later
 - `github.com/cloudflare/circl v1.6.2` (resolved by `go mod tidy`)
 
-### Python (Ed25519, ML-DSA-65 out of scope)
+### Python from a clone (Ed25519, ML-DSA-65 out of scope)
 
 ```bash
 cd verifiers/python
@@ -52,7 +66,8 @@ For full hybrid verification end to end, use the Go verifier.
 ### Parity
 
 To additionally assert the two verifiers agree with each other per fixture
-(gate status, verdict, reject category):
+(gate status, verdict, reject category), and that the Go verifier's
+built-in set is a byte copy of `fixtures/` with the same results:
 
 ```bash
 python3 scripts/parity/parity.py
@@ -107,7 +122,9 @@ enforces every claim in this README on each push and pull request:
 3. The cross-implementation parity gate
    ([`scripts/parity/parity.py`](./scripts/parity/parity.py)) asserts the Go
    and Python verifiers agree per fixture on gate status, verdict, and
-   reject category.
+   reject category. It also runs the Go verifier with no arguments, as the
+   first command above does, and fails unless that run agrees with the
+   other two and the built-in set is a byte copy of `fixtures/`.
 4. The parity gate publishes `parity-report.json` as a CI artifact.
 5. `conformance.json` must match the fixture set.
 6. Schema validation

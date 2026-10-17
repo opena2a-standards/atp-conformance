@@ -16,10 +16,17 @@
 //
 // Usage:
 //
+//	go run github.com/opena2a-standards/atp-conformance/verifiers/go@latest
+//	go run .                             (no arguments; the built-in fixture set)
 //	go run . ../../fixtures/trust-proof-baseline.json
 //	go run . ../../fixtures/*.json
 //	go run . ../../fixtures              (directory; walks *.json)
 //	go run . ../..                       (repo root; walks fixtures/*.json)
+//
+// With no arguments it verifies the fixture set built into the binary: the
+// fixtures/ directory next to this file, a byte copy of the repository's
+// fixtures/. That is what lets the first form above run the suite without a
+// clone. scripts/parity/parity.py fails when the copy and fixtures/ differ.
 //
 // Exit 0 iff every fixture's observed result matches expected.verifyResult.
 package main
@@ -27,20 +34,29 @@ package main
 import (
 	"crypto/ed25519"
 	"crypto/sha256"
+	"embed"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 )
+
+// builtinFixtures is the fixture set a run with no arguments verifies.
+//
+//go:embed fixtures/*.json
+var builtinFixtures embed.FS
 
 // ---------------------------------------------------------------------------
 // fixture shape (mirror of generator)
@@ -904,12 +920,21 @@ func verify(f fixture) result {
 }
 
 func main() {
+	var (
+		paths []string
+		err   error
+		load  = loadFixture
+		show  = relPath
+	)
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: verify <fixture.json|dir>...")
-		os.Exit(2)
+		paths, err = builtinFixturePaths()
+		load, show = loadBuiltinFixture, func(p string) string { return p }
+		if err == nil {
+			fmt.Println(builtinHeader(len(paths)))
+		}
+	} else {
+		paths, err = expandFixturePaths(os.Args[1:])
 	}
-
-	paths, err := expandFixturePaths(os.Args[1:])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(2)
@@ -919,11 +944,31 @@ func main() {
 		os.Exit(2)
 	}
 
-	totalPass, totalFail := 0, 0
+	if _, totalFail := verifyAll(os.Stdout, paths, load, show); totalFail > 0 {
+		os.Exit(1)
+	}
+}
+
+// builtinHeader names the fixture set a run with no arguments verifies: the
+// module path and version this binary was built from, and how to verify
+// other fixtures instead.
+func builtinHeader(n int) string {
+	from := "this binary"
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Path != "" {
+		from = strings.TrimSpace(info.Main.Path + " " + info.Main.Version)
+	}
+	return fmt.Sprintf("verifying the %d fixtures built into %s\n"+
+		"to verify other fixtures, pass their files or a directory as arguments\n", n, from)
+}
+
+// verifyAll verifies the fixture at each path, writes one block per fixture
+// and the summary line to w, and returns the pass and fail counts. load reads
+// a path and show formats it for output.
+func verifyAll(w io.Writer, paths []string, load func(string) (fixture, error), show func(string) string) (totalPass, totalFail int) {
 	for _, p := range paths {
-		f, err := loadFixture(p)
+		f, err := load(p)
 		if err != nil {
-			fmt.Printf("FAIL  %s  (load error: %v)\n", relPath(p), err)
+			fmt.Fprintf(w, "FAIL  %s  (load error: %v)\n", show(p), err)
 			totalFail++
 			continue
 		}
@@ -947,24 +992,22 @@ func main() {
 		} else {
 			totalPass++
 		}
-		fmt.Printf("%s  %s  [%s]\n", status, relPath(p), f.FixtureType)
-		fmt.Printf("       expected: %s", f.Expected.VerifyResult)
+		fmt.Fprintf(w, "%s  %s  [%s]\n", status, show(p), f.FixtureType)
+		fmt.Fprintf(w, "       expected: %s", f.Expected.VerifyResult)
 		if f.Expected.RejectCategory != "" {
-			fmt.Printf(" [%s]", f.Expected.RejectCategory)
+			fmt.Fprintf(w, " [%s]", f.Expected.RejectCategory)
 		}
-		fmt.Println()
-		fmt.Printf("       observed: %s\n", got)
+		fmt.Fprintln(w)
+		fmt.Fprintf(w, "       observed: %s\n", got)
 		if got.SigsExpected > 0 {
-			fmt.Printf("       signatures: %d/%d valid (ed25519=%t mldsa65=%t)\n",
+			fmt.Fprintf(w, "       signatures: %d/%d valid (ed25519=%t mldsa65=%t)\n",
 				got.SigsValid, got.SigsExpected, got.Ed25519Valid, got.MLDSA65Valid)
 		}
 	}
 
-	fmt.Println()
-	fmt.Printf("summary: %d pass, %d fail (%d fixtures)\n", totalPass, totalFail, totalPass+totalFail)
-	if totalFail > 0 {
-		os.Exit(1)
-	}
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "summary: %d pass, %d fail (%d fixtures)\n", totalPass, totalFail, totalPass+totalFail)
+	return totalPass, totalFail
 }
 
 func loadFixture(path string) (fixture, error) {
@@ -974,6 +1017,26 @@ func loadFixture(path string) (fixture, error) {
 	if err != nil {
 		return fixture{}, err
 	}
+	return parseFixture(b)
+}
+
+// builtinFixturePaths lists the fixture set built into the binary, sorted.
+func builtinFixturePaths() ([]string, error) {
+	paths, err := fs.Glob(builtinFixtures, "fixtures/*.json")
+	sort.Strings(paths)
+	return paths, err
+}
+
+// loadBuiltinFixture reads one fixture from the set built into the binary.
+func loadBuiltinFixture(path string) (fixture, error) {
+	b, err := builtinFixtures.ReadFile(path)
+	if err != nil {
+		return fixture{}, err
+	}
+	return parseFixture(b)
+}
+
+func parseFixture(b []byte) (fixture, error) {
 	var f fixture
 	if err := json.Unmarshal(b, &f); err != nil {
 		return fixture{}, err

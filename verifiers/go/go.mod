@@ -1,4 +1,4 @@
-module github.com/opena2a-org/atp-conformance/verifiers/go
+module github.com/opena2a-standards/atp-conformance/verifiers/go
 
 go 1.22.0
 
