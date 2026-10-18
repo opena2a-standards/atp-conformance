@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Regression tests for verify.py: the ATP §8.1 revocation-entry checks and
-the PARSE_ERROR verdict for members of the wrong JSON type, under the
-wire-shape rules both reference verifiers apply.
+"""Regression tests for verify.py: the ATP §8.1 revocation-entry checks, the
+PARSE_ERROR verdict for members of the wrong JSON type, under the wire-shape
+rules both reference verifiers apply, and the PARSE_ERROR verdict for a value
+that makes Python raise OverflowError.
 
 Run from this directory:
     python3 -m unittest -v test_verify
@@ -341,6 +342,81 @@ class FixtureDocumentTest(unittest.TestCase):
     def test_committed_fixture_parses(self) -> None:
         doc = verify.parse_fixture((FIXTURES / "trust-proof-baseline.json").read_text())
         self.assertEqual(doc["fixtureType"], "trustProof")
+
+
+def fixture_text_with(name: str, old: str, new: str) -> str:
+    """The text of a committed fixture with one literal replaced, for a value
+    a fixture file can carry but json.dumps does not write (1e400)."""
+    text = (FIXTURES / name).read_text()
+    if text.count(old) != 1:
+        raise AssertionError(f"{old!r} does not occur exactly once in {name}")
+    return text.replace(old, new)
+
+
+# RFC 3339 timestamps whose UTC equivalent falls outside the years 1 to 9999
+# that Python's datetime holds, so converting them to UTC raises
+# OverflowError.
+OUT_OF_RANGE_TIMES = ("0001-01-01T00:00:00+01:00", "9999-12-31T23:59:59-01:00")
+
+
+class OverflowErrorTest(unittest.TestCase):
+    """A fixture value that makes a verification step raise OverflowError is
+    REJECT[PARSE_ERROR] for that fixture, not a traceback that ends the run:
+    a directory run goes on to the fixtures after it and prints its summary.
+    The trust-proof steps raise it when they convert issuedAt, expiresAt or
+    the verifier's clockRfc3339 to UTC and the value is in
+    OUT_OF_RANGE_TIMES. The number literal 1e400, which json.loads reads as
+    infinity, is refused by the wire-shape check in the integer members the
+    directory run sets it in."""
+
+    def test_out_of_range_time_is_parse_error(self) -> None:
+        for path in ("trustProof.issuedAt", "trustProof.expiresAt", "verifierState.clockRfc3339"):
+            for value in OUT_OF_RANGE_TIMES:
+                with self.subTest(path=path, value=value):
+                    got = verify.verify_fixture(
+                        with_member(load("trust-proof-baseline.json"), path, json.dumps(value))
+                    )
+                    self.assertFalse(got.accepted, str(got))
+                    self.assertEqual(got.reject_category, "PARSE_ERROR", str(got))
+                    self.assertIn("OverflowError", got.reason)
+
+    def test_directory_run_continues_and_prints_summary(self) -> None:
+        files = {
+            "a-revocation-index.json": fixture_text_with(
+                "revocation-list-valid.json", '"transparencyLogIndex": 1847300', '"transparencyLogIndex": 1e400'
+            ),
+            "b-inclusion-index.json": fixture_text_with(
+                "transparency-inclusion-proof-valid.json", '"logIndex": 3,', '"logIndex": 1e400,'
+            ),
+            "c-tree-size.json": fixture_text_with(
+                "transparency-log-sth.json", '"treeSize": 1847294,', '"treeSize": 1e400,'
+            ),
+            "d-expires-at.json": fixture_text_with(
+                "trust-proof-baseline.json",
+                '"expiresAt": "2026-05-24T06:00:00Z"',
+                f'"expiresAt": "{OUT_OF_RANGE_TIMES[1]}"',
+            ),
+            "e-valid.json": (FIXTURES / "revocation-list-valid.json").read_text(),
+        }
+        with tempfile.TemporaryDirectory() as d:
+            for name, text in files.items():
+                (Path(d) / name).write_text(text)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = verify.main(["verify.py", d])
+        lines = out.getvalue().splitlines()
+        observed = [ln.strip() for ln in lines if ln.strip().startswith("observed:")]
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            [ln.split()[0] for ln in lines if ln.startswith(("PASS", "FAIL"))],
+            ["FAIL", "FAIL", "FAIL", "FAIL", "PASS"],
+        )
+        self.assertEqual(len(observed), 5, observed)
+        for got, wanted in zip(observed, ("transparencyLogIndex", "logIndex", "treeSize", "OverflowError")):
+            self.assertTrue(got.startswith("observed: REJECT[PARSE_ERROR"), got)
+            self.assertIn(wanted, got)
+        self.assertEqual(observed[-1], "observed: ACCEPT")
+        self.assertEqual(lines[-1], "summary: 1 pass, 4 fail (5 fixtures)")
 
 
 if __name__ == "__main__":
