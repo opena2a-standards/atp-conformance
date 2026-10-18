@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Assert the fixture counts stated in README.md, and the per-fixture table in
-docs/fixtures.md, match the fixture set.
+docs/fixtures.md, match the fixture set, and that README.md gives the
+commands of the verifier unit suites the conformance workflow does not run.
 
 The README states the expected verifier result in four places: the summary
 under "Running the verifiers" ("summary: N pass, 0 fail (N fixtures)" and
@@ -23,7 +24,19 @@ exactly one row, each row must name a fixture in fixtures/, and the Type and
 Expected cells must equal the fixture's fixtureType and expected block
 ("ACCEPT", or "REJECT (`CATEGORY`)" with the pinned reject category).
 
-Exit 0 when every stated count and table row matches the fixture set, 1
+The README's Continuous verification section lists the checks
+.github/workflows/conformance.yml runs, then gives in a code block the
+commands of the verifier unit suites the workflow does not run. Those suites
+test the rules the README states for member types, repeated member names,
+timestamps and hex values on cases the fixtures do not carry. The section's
+code blocks must hold the command of each unit suite the workflow does not
+run, and no command of a suite it runs. A suite counts as run when the
+workflow, comment lines aside, contains `go test` (verifiers/go holds the
+repository's only Go tests) or names `test_verify`, the Python verifier's
+suite. The section once said the workflow enforced every claim in the README
+while the workflow ran neither suite.
+
+Exit 0 when every stated count, table row and unit-suite command matches, 1
 otherwise.
 """
 
@@ -38,6 +51,16 @@ FIXTURE_DOC = ROOT / "docs" / "fixtures.md"
 FIXTURES = ROOT / "fixtures"
 
 FIXTURE_TABLE_HEADER = ["Fixture", "Type", "Expected", "Exercises"]
+
+WORKFLOW = ROOT / ".github" / "workflows" / "conformance.yml"
+CI_SECTION = "Continuous verification"
+
+# The verifier unit suites: the directory each runs in, the command the
+# README gives for it, and the text that shows the workflow runs it.
+UNIT_SUITES = [
+    ("verifiers/go", "go test ./...", re.compile(r"\bgo\s+test\b")),
+    ("verifiers/python", "python3 -m unittest test_verify", re.compile(r"\btest_verify\b")),
+]
 
 
 def readme_failures(outcomes):
@@ -184,6 +207,49 @@ def fixture_table_failures(paths):
     return failures
 
 
+def unit_suite_failures():
+    """Failures for the unit-suite commands in the README's Continuous
+    verification section, read against the workflow."""
+    readme = README.read_text(encoding="utf-8")
+    workflow = "\n".join(
+        line
+        for line in WORKFLOW.read_text(encoding="utf-8").splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    heading = re.search(rf"^## {re.escape(CI_SECTION)}[ \t]*$", readme, re.M)
+    if heading is None:
+        return [f"no `## {CI_SECTION}` section found in README"]
+    following = re.compile(r"^## ", re.M).search(readme, heading.end())
+    end = following.start() if following else len(readme)
+    blocks = [
+        m.span(1)
+        for m in re.compile(r"^```[^\n]*\n(.*?)^```", re.M | re.S).finditer(
+            readme, heading.end(), end
+        )
+    ]
+
+    def line(offset):
+        return f"{README.name}:{readme.count(chr(10), 0, offset) + 1}"
+
+    failures = []
+    for directory, command, runs in UNIT_SUITES:
+        given = next(
+            (at for at in (readme.find(command, *span) for span in blocks) if at != -1),
+            None,
+        )
+        if runs.search(workflow) and given is not None:
+            failures.append(
+                f"{line(given)}: {WORKFLOW.name} runs the {directory} unit suite, but "
+                f"the {CI_SECTION} section gives `{command}` as one it does not run"
+            )
+        elif not runs.search(workflow) and given is None:
+            failures.append(
+                f"{line(heading.start())}: {WORKFLOW.name} does not run the {directory} "
+                f"unit suite, and the {CI_SECTION} section does not give `{command}`"
+            )
+    return failures
+
+
 def main():
     paths = sorted(FIXTURES.glob("*.json"))
     actual = len(paths)
@@ -195,9 +261,14 @@ def main():
         json.loads(path.read_text(encoding="utf-8"))["expected"]["verifyResult"]
         for path in paths
     ]
-    failures = readme_failures(outcomes) + fixture_table_failures(paths)
+    failures = (
+        readme_failures(outcomes) + fixture_table_failures(paths) + unit_suite_failures()
+    )
     if failures:
-        print("README.md or docs/fixtures.md does not match fixtures/:\n", file=sys.stderr)
+        print(
+            "README.md or docs/fixtures.md does not match fixtures/ or the workflow:\n",
+            file=sys.stderr,
+        )
         for f in failures:
             print(f"  - {f}", file=sys.stderr)
         return 1
@@ -210,6 +281,10 @@ def main():
     print(
         f"docs/fixtures.md Fixtures table: one row for each of the {actual} fixtures, "
         "Type and Expected matching"
+    )
+    print(
+        f"README {CI_SECTION}: gives the command of each verifier unit suite "
+        f"{WORKFLOW.name} does not run, and of no suite it runs"
     )
     return 0
 
