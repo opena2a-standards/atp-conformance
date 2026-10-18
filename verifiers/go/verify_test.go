@@ -532,6 +532,21 @@ func TestModulePathIsTheReadmeEntryPoint(t *testing.T) {
 	}
 }
 
+// TestFixtureGeneratorModulePath: the fixture generator's go.mod declares
+// its directory under the same repository path as modulePath, so `go run
+// <path>@<version>` resolves it as it resolves this module.
+func TestFixtureGeneratorModulePath(t *testing.T) {
+	const dir = "scripts/generate-fixtures"
+	mod, err := fs.ReadFile(os.DirFS(filepath.Join("..", "..", dir)), "go.mod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "module " + strings.TrimSuffix(modulePath, "/verifiers/go") + "/" + dir
+	if first, _, _ := strings.Cut(string(mod), "\n"); first != want {
+		t.Errorf("%s/go.mod declares %q, want %q", dir, first, want)
+	}
+}
+
 // TestBuiltinFixturesAreTheFixturesDirectory: the set a run with no
 // arguments verifies holds the same files as ../../fixtures, byte for byte.
 // scripts/parity/parity.py makes the same check in CI.

@@ -109,12 +109,30 @@ def _normalize_rfc3339(s: str) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _parse_rfc3339_strict(value: str) -> datetime:
+    # Python's fromisoformat accepts a space separator and zone-less
+    # timestamps; the wire rule is RFC 3339 (as Go's time.RFC3339 layout
+    # enforces), so require the 'T' separator and a zone designator.
+    if "T" not in value:
+        raise ValueError("missing 'T' date/time separator")
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        raise ValueError("missing zone designator")
+    return dt
+
+
 def index_public_keys(refs: list[dict[str, Any]]):
+    # A configured key that is not hex or not 32 bytes is skipped, as the Go
+    # verifier's indexPublicKeys skips it: a signature then fails to verify
+    # against the remaining keys.
     eds: list[Ed25519PublicKey] = []
     mldsa_present = False
     for r in refs:
         if r["algorithm"] == "Ed25519":
-            raw = bytes.fromhex(r["publicKeyHex"])
+            try:
+                raw = bytes.fromhex(r["publicKeyHex"])
+            except ValueError:
+                continue
             if len(raw) != 32:
                 continue
             eds.append(Ed25519PublicKey.from_public_bytes(raw))
@@ -231,11 +249,37 @@ class ShapeError(ValueError):
     """A wire value whose JSON type or range does not fit its member's shape."""
 
 
+class _IntLiteral:
+    """A JSON integer literal with more digits than int() converts under
+    sys.get_int_max_str_digits(), kept as its text. Such a literal is far
+    outside the signed 64-bit range and the binary64 range, so it fits no
+    "integer" or "number" shape and _decode reports it as REJECT[PARSE_ERROR],
+    as the Go verifier does, instead of json.loads raising ValueError and the
+    fixture becoming a load error."""
+
+    __slots__ = ("literal",)
+
+    def __init__(self, literal: str) -> None:
+        self.literal = literal
+
+    def __repr__(self) -> str:
+        return self.literal
+
+
+def _parse_int(literal: str) -> int | _IntLiteral:
+    try:
+        return int(literal)
+    except ValueError:
+        return _IntLiteral(literal)
+
+
 def _json_kind(value: Any) -> str:
     """The JSON type of a decoded value, with the literal for numbers, in the
     words the Go verifier's decode error uses."""
     if value is None:
         return "null"
+    if isinstance(value, _IntLiteral):
+        return f"number {value.literal}"
     if isinstance(value, bool):
         return "bool"
     if isinstance(value, (int, float)):
@@ -412,6 +456,60 @@ def _decode_payload(fixture: dict[str, Any], label: str, shape: dict[str, Any]) 
 
 
 # ---------------------------------------------------------------------------
+# verifier state
+#
+# verifierState configures the verifier (its clock, trusted issuers and
+# public keys); it is not part of the response under test. The Go verifier
+# decodes it with encoding/json into its verifierState struct while it loads
+# the fixture, so there a member of the wrong JSON type is a load error, and
+# a member that is absent or JSON null takes the Go zero value ("" or []).
+# _verifier_state applies the same rules. parse_fixture reports its
+# VerifierStateError as a load error; verify_fixture, given a fixture that
+# did not come through parse_fixture, reports it as VERIFIER_CONFIG_ERROR.
+# Neither is a PARSE_ERROR, which names a payload member.
+# ---------------------------------------------------------------------------
+
+# The members of one verifierState.publicKeys entry, as the Go verifier's
+# keypairRef struct names them.
+_KEYPAIR_REF_MEMBERS = ("role", "path", "algorithm", "publicKeyHex", "keyId")
+
+
+class VerifierStateError(Exception):
+    """A verifierState member whose JSON type does not fit the verifier's configuration."""
+
+
+def _state_value(label: str, value: Any, kind: type, word: str) -> Any:
+    if value is None:
+        return kind()
+    if isinstance(value, kind):
+        return value
+    raise VerifierStateError(f"{label}: JSON {_json_kind(value)} does not fit the {word} the verifier requires")
+
+
+def _verifier_state(fixture: dict[str, Any]) -> dict[str, Any]:
+    """The fixture's verifierState decoded the way the Go verifier decodes
+    it: clockRfc3339 a string, trustedIssuers a list of strings and
+    publicKeys a list of objects of _KEYPAIR_REF_MEMBERS strings. Raises
+    VerifierStateError naming the member."""
+    state = _state_value("verifierState", fixture.get("verifierState"), dict, "object")
+    issuers = _state_value("verifierState.trustedIssuers", state.get("trustedIssuers"), list, "array")
+    refs = _state_value("verifierState.publicKeys", state.get("publicKeys"), list, "array")
+    keys = []
+    for i, ref in enumerate(refs):
+        ref = _state_value(f"verifierState.publicKeys[{i}]", ref, dict, "object")
+        keys.append(
+            {m: _state_value(f"verifierState.publicKeys[{i}].{m}", ref.get(m), str, "string") for m in _KEYPAIR_REF_MEMBERS}
+        )
+    return {
+        "clockRfc3339": _state_value("verifierState.clockRfc3339", state.get("clockRfc3339"), str, "string"),
+        "trustedIssuers": [
+            _state_value(f"verifierState.trustedIssuers[{i}]", v, str, "string") for i, v in enumerate(issuers)
+        ],
+        "publicKeys": keys,
+    }
+
+
+# ---------------------------------------------------------------------------
 # per-type verifiers
 # ---------------------------------------------------------------------------
 
@@ -440,7 +538,7 @@ def verify_discovery(fixture: dict[str, Any]) -> VerifyResult:
     if not d["publicKeys"]:
         return VerifyResult(reject_category="DISCOVERY_INVALID", reason="publicKeys missing")
 
-    vs = fixture["verifierState"]
+    vs = _verifier_state(fixture)
     if d["authorityDid"] not in vs.get("trustedIssuers", []):
         return VerifyResult(
             reject_category="UNTRUSTED_ISSUER",
@@ -503,8 +601,11 @@ def verify_trust_proof(fixture: dict[str, Any]) -> VerifyResult:
             reject_category="PARSE_ERROR",
             reason=f"trustProof.transparencyLogIndex {log_index} must be >= 0",
         )
-    vs = fixture["verifierState"]
-    now = datetime.fromisoformat(vs["clockRfc3339"].replace("Z", "+00:00")).astimezone(timezone.utc)
+    vs = _verifier_state(fixture)
+    try:
+        now = _parse_rfc3339_strict(vs["clockRfc3339"]).astimezone(timezone.utc)
+    except (ValueError, OverflowError) as exc:
+        return VerifyResult(reject_category="VERIFIER_CONFIG_ERROR", reason=f"bad clockRfc3339: {exc}")
 
     # Step 1: expiry.
     try:
@@ -598,7 +699,7 @@ def verify_sth(fixture: dict[str, Any]) -> VerifyResult:
         return VerifyResult(reject_category="PARSE_ERROR", reason=str(exc))
     if sth is None:
         return VerifyResult(reject_category="PARSE_ERROR", reason="signedTreeHead missing")
-    vs = fixture["verifierState"]
+    vs = _verifier_state(fixture)
 
     if sth["treeSize"] <= 0:
         return VerifyResult(reject_category="STH_INVALID", reason=f"treeSize {sth['treeSize']} must be > 0")
@@ -740,7 +841,7 @@ def verify_inclusion_proof(fixture: dict[str, Any]) -> VerifyResult:
         return VerifyResult(reject_category="PARSE_ERROR", reason=str(exc))
     if ip is None:
         return VerifyResult(reject_category="PARSE_ERROR", reason="inclusionProof missing")
-    vs = fixture["verifierState"]
+    vs = _verifier_state(fixture)
 
     try:
         leaf = _wire_hash_bytes(ip["leafHash"])
@@ -773,7 +874,7 @@ def verify_consistency_proof(fixture: dict[str, Any]) -> VerifyResult:
         return VerifyResult(reject_category="PARSE_ERROR", reason=str(exc))
     if cp is None:
         return VerifyResult(reject_category="PARSE_ERROR", reason="consistencyProof missing")
-    vs = fixture["verifierState"]
+    vs = _verifier_state(fixture)
 
     from_sth = cp["fromSignedTreeHead"]
     to_sth = cp["toSignedTreeHead"]
@@ -814,16 +915,6 @@ def verify_revocation_list(fixture: dict[str, Any]) -> VerifyResult:
     if rl is None:
         return VerifyResult(reject_category="PARSE_ERROR", reason="revocationList missing")
 
-    def _parse_rfc3339_strict(value: str) -> None:
-        # Python's fromisoformat accepts a space separator and zone-less
-        # timestamps; the wire rule is RFC 3339 (as Go's time.RFC3339 layout
-        # enforces), so require the 'T' separator and a zone designator.
-        if "T" not in value:
-            raise ValueError("missing 'T' date/time separator")
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            raise ValueError("missing zone designator")
-
     next_since = rl["nextSince"]
     if not next_since:
         return VerifyResult(reject_category="PARSE_ERROR", reason="nextSince missing")
@@ -856,15 +947,18 @@ def verify_revocation_list(fixture: dict[str, Any]) -> VerifyResult:
 # ---------------------------------------------------------------------------
 
 def verify_fixture(fixture: dict[str, Any]) -> VerifyResult:
-    # A member of the wrong JSON type (null, a string where an integer is
-    # required, a number where an object is required) surfaces as one of
-    # these exceptions inside the per-type verifiers, and so does a timestamp
-    # whose UTC equivalent falls outside the years 1 to 9999 that datetime
-    # holds (OverflowError from astimezone). It is a PARSE_ERROR for this
-    # fixture, not a reason to abort the run.
+    # A payload timestamp whose UTC equivalent falls outside the years 1 to
+    # 9999 that datetime holds raises OverflowError (from astimezone) inside
+    # the per-type verifiers, and a payload value they parse can raise
+    # ValueError. That is a PARSE_ERROR for this fixture, not a reason to
+    # abort the run. A verifierState member of the wrong type is a
+    # VERIFIER_CONFIG_ERROR. Any other exception is a defect in this verifier
+    # and propagates; main reports it as a verifier error with no verdict.
     try:
         return _verify_fixture(fixture)
-    except (TypeError, ValueError, AttributeError, KeyError, IndexError, OverflowError) as exc:
+    except VerifierStateError as exc:
+        return VerifyResult(reject_category="VERIFIER_CONFIG_ERROR", reason=str(exc))
+    except (ValueError, OverflowError) as exc:
         ft = fixture.get("fixtureType") if isinstance(fixture, dict) else None
         return VerifyResult(
             reject_category="PARSE_ERROR",
@@ -900,14 +994,25 @@ def parse_fixture(text: str) -> dict[str, Any]:
     document must be a JSON object, may not use the NaN / Infinity
     extensions, and may not hold a JSON object outside the payload members
     that repeats a member name (a repeat inside one is a PARSE_ERROR verdict
-    from _decode_payload). A document this refuses is a load error, not a
-    verdict."""
-    fixture = json.loads(text, object_pairs_hook=_JSONObject.from_pairs, parse_constant=_reject_non_finite)
+    from _decode_payload), nor a verifierState member of the wrong JSON
+    type. A document this refuses is a load error, not a verdict. An integer
+    literal too long for int() is kept as an _IntLiteral rather than
+    refused."""
+    fixture = json.loads(
+        text,
+        object_pairs_hook=_JSONObject.from_pairs,
+        parse_constant=_reject_non_finite,
+        parse_int=_parse_int,
+    )
     if not isinstance(fixture, dict):
         raise ValueError(f"top-level JSON value is {type(fixture).__name__}, not an object")
     repeated = _repeated_member("", fixture, _PAYLOAD_MEMBERS)
     if repeated:
         raise ValueError(f"{repeated}: duplicate member name")
+    try:
+        _verifier_state(fixture)
+    except VerifierStateError as exc:
+        raise ValueError(str(exc)) from exc
     return fixture
 
 
@@ -952,7 +1057,12 @@ def main(argv: list[str]) -> int:
             total_fail += 1
             continue
 
-        got = verify_fixture(fixture)
+        try:
+            got = verify_fixture(fixture)
+        except Exception as exc:
+            print(f"FAIL  {p}  (verifier error: {type(exc).__name__}: {exc})")
+            total_fail += 1
+            continue
         expected = fixture.get("expected")
         if not isinstance(expected, dict):
             expected = {}

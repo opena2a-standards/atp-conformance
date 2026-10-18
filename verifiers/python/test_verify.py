@@ -2,8 +2,9 @@
 """Regression tests for verify.py: the ATP §8.1 revocation-entry checks, the
 PARSE_ERROR verdict for members of the wrong JSON type and the reading of
 each member by its exact name, under the wire-shape rules both reference
-verifiers apply, and the PARSE_ERROR verdict for a value that makes Python
-raise OverflowError.
+verifiers apply, the PARSE_ERROR verdict for a value that makes Python
+raise OverflowError and for an integer literal too long for int(), and the
+VERIFIER_CONFIG_ERROR verdict or load error for a bad verifierState.
 
 Run from this directory:
     python3 -m unittest -v test_verify
@@ -18,6 +19,7 @@ import json
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 from typing import Any
 
@@ -418,14 +420,15 @@ class OverflowErrorTest(unittest.TestCase):
     """A fixture value that makes a verification step raise OverflowError is
     REJECT[PARSE_ERROR] for that fixture, not a traceback that ends the run:
     a directory run goes on to the fixtures after it and prints its summary.
-    The trust-proof steps raise it when they convert issuedAt, expiresAt or
-    the verifier's clockRfc3339 to UTC and the value is in
-    OUT_OF_RANGE_TIMES. The number literal 1e400, which json.loads reads as
-    infinity, is refused by the wire-shape check in the integer members the
-    directory run sets it in."""
+    The trust-proof steps raise it when they convert issuedAt or expiresAt
+    to UTC and the value is in OUT_OF_RANGE_TIMES; the same value in the
+    verifier's clockRfc3339 is a VERIFIER_CONFIG_ERROR (VerifierStateTest).
+    The number literal 1e400, which json.loads reads as infinity, is refused
+    by the wire-shape check in the integer members the directory run sets it
+    in."""
 
     def test_out_of_range_time_is_parse_error(self) -> None:
-        for path in ("trustProof.issuedAt", "trustProof.expiresAt", "verifierState.clockRfc3339"):
+        for path in ("trustProof.issuedAt", "trustProof.expiresAt"):
             for value in OUT_OF_RANGE_TIMES:
                 with self.subTest(path=path, value=value):
                     got = verify.verify_fixture(
@@ -535,6 +538,166 @@ class RepeatedMemberNameTest(unittest.TestCase):
         got = verify.verify_fixture(doc)
         self.assertEqual(got.reject_category, "PARSE_ERROR", str(got)[:200])
         self.assertEqual(got.reason, "signedTreeHead.note" + "[0]" * depth + ".a: duplicate member name")
+
+
+def run_main(files: dict[str, str]) -> tuple[int, list[str]]:
+    """verify.main over a directory holding files, with its exit code and
+    output lines."""
+    with tempfile.TemporaryDirectory() as d:
+        for name, text in files.items():
+            (Path(d) / name).write_text(text)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = verify.main(["verify.py", d])
+    return code, out.getvalue().splitlines()
+
+
+class VerifierStateTest(unittest.TestCase):
+    """A problem in verifierState, the verifier's own configuration, is
+    reported as the Go verifier reports it: a clockRfc3339 string that is
+    not an RFC 3339 timestamp is REJECT[VERIFIER_CONFIG_ERROR], and a
+    verifierState member of the wrong JSON type is a load error (or
+    VERIFIER_CONFIG_ERROR for a fixture that did not come through
+    parse_fixture). Neither is a PARSE_ERROR, which names a payload
+    member."""
+
+    def assert_config_error(self, got: verify.VerifyResult, reason: str) -> None:
+        self.assertFalse(got.accepted, str(got))
+        self.assertEqual(got.reject_category, "VERIFIER_CONFIG_ERROR", str(got))
+        self.assertTrue(got.reason.startswith(reason), str(got))
+
+    def test_bad_clock_string_is_config_error(self) -> None:
+        for value in ("not-a-time", "", "2026-05-24 00:00:00Z", "2026-05-24T00:00:00", *OUT_OF_RANGE_TIMES):
+            with self.subTest(value=value):
+                fx = with_member(load("trust-proof-baseline.json"), "verifierState.clockRfc3339", json.dumps(value))
+                self.assert_config_error(verify.verify_fixture(fx), "bad clockRfc3339: ")
+
+    def test_wrong_type_member_is_a_load_error(self) -> None:
+        for path, literal, label in (
+            ("verifierState.clockRfc3339", "5", "verifierState.clockRfc3339"),
+            ("verifierState.trustedIssuers", '"did:x"', "verifierState.trustedIssuers"),
+            ("verifierState.trustedIssuers", "[7]", "verifierState.trustedIssuers[0]"),
+            ("verifierState.publicKeys", "{}", "verifierState.publicKeys"),
+            ("verifierState.publicKeys", "[true]", "verifierState.publicKeys[0]"),
+            ("verifierState.publicKeys.0.publicKeyHex", "[]", "verifierState.publicKeys[0].publicKeyHex"),
+            ("verifierState", "[]", "verifierState"),
+        ):
+            with self.subTest(path=path, literal=literal):
+                fx = with_member(load("trust-proof-baseline.json"), path, literal)
+                with self.assertRaises(ValueError) as caught:
+                    verify.parse_fixture(json.dumps(fx))
+                self.assertTrue(str(caught.exception).startswith(f"{label}: JSON "), str(caught.exception))
+                self.assert_config_error(verify.verify_fixture(fx), f"{label}: JSON ")
+
+    def test_null_and_absent_members_take_the_zero_value(self) -> None:
+        # encoding/json leaves a struct field at its zero value for JSON null:
+        # an empty clock is a bad clock, an empty trusted set trusts no issuer.
+        fx = with_member(load("trust-proof-baseline.json"), "verifierState.clockRfc3339", "null")
+        self.assert_config_error(verify.verify_fixture(verify.parse_fixture(json.dumps(fx))), "bad clockRfc3339: ")
+        for literal in ("null", "{}"):
+            with self.subTest(verifierState=literal):
+                fx = with_member(load("trust-proof-baseline.json"), "verifierState", literal)
+                got = verify.verify_fixture(verify.parse_fixture(json.dumps(fx)))
+                self.assertEqual(got.reject_category, "VERIFIER_CONFIG_ERROR", str(got))
+                fx = with_member(load("transparency-log-sth.json"), "verifierState", literal)
+                got = verify.verify_fixture(verify.parse_fixture(json.dumps(fx)))
+                self.assertEqual(got.reject_category, "SIGNATURE_INVALID", str(got))
+
+    def test_non_hex_configured_key_is_skipped(self) -> None:
+        fx = with_member(load("transparency-log-sth.json"), "verifierState.publicKeys.0.publicKeyHex", '"zz"')
+        got = verify.verify_fixture(fx)
+        self.assertEqual(got.reject_category, "SIGNATURE_INVALID", str(got))
+
+    def test_directory_run_reports_load_error_and_config_error(self) -> None:
+        code, lines = run_main(
+            {
+                "a-clock-number.json": fixture_text_with(
+                    "trust-proof-baseline.json", '"clockRfc3339": "2026-05-24T00:00:00Z"', '"clockRfc3339": 5'
+                ),
+                "b-clock-string.json": fixture_text_with(
+                    "trust-proof-baseline.json", '"clockRfc3339": "2026-05-24T00:00:00Z"', '"clockRfc3339": "not-a-time"'
+                ),
+                "c-valid.json": (FIXTURES / "trust-proof-baseline.json").read_text(),
+            }
+        )
+        self.assertEqual(code, 1)
+        results = [ln for ln in lines if ln.startswith(("PASS", "FAIL"))]
+        self.assertEqual([ln.split()[0] for ln in results], ["FAIL", "FAIL", "PASS"])
+        self.assertIn("(load error: verifierState.clockRfc3339: JSON number 5 does not fit the string", results[0])
+        observed = [ln.strip() for ln in lines if ln.strip().startswith("observed:")]
+        self.assertTrue(observed[0].startswith("observed: REJECT[VERIFIER_CONFIG_ERROR: bad clockRfc3339: "), observed[0])
+        self.assertEqual(observed[1], "observed: ACCEPT")
+
+
+# An integer literal longer than the 4300 digits int() converts by default.
+LONG_INTEGER = "9" * 5000
+
+
+class LongIntegerLiteralTest(unittest.TestCase):
+    """An integer literal too long for int() is read, not a load error: in
+    an integer or number member it is REJECT[PARSE_ERROR] naming the member,
+    as the Go verifier reports it."""
+
+    def test_long_integer_is_parse_error(self) -> None:
+        for name, old, label, word in (
+            (
+                "revocation-list-valid.json",
+                '"transparencyLogIndex": 1847300',
+                "revocationList.revocations[0].transparencyLogIndex",
+                "integer",
+            ),
+            ("trust-proof-baseline.json", '"trustScore": 0.825', "trustProof.trustScore", "number"),
+            ("transparency-log-sth.json", '"treeSize": 1847294', "signedTreeHead.treeSize", "integer"),
+        ):
+            for literal in (LONG_INTEGER, "-" + LONG_INTEGER):
+                with self.subTest(label=label, sign=literal[0]):
+                    text = fixture_text_with(name, old, old.split(":")[0] + ": " + literal)
+                    got = verify.verify_fixture(verify.parse_fixture(text))
+                    self.assertEqual(got.reject_category, "PARSE_ERROR", str(got)[:200])
+                    self.assertEqual(
+                        got.reason, f"{label}: JSON number {literal} does not fit the {word} the schema requires"
+                    )
+
+    def test_directory_run_gives_a_verdict(self) -> None:
+        code, lines = run_main(
+            {
+                "a.json": fixture_text_with(
+                    "revocation-list-valid.json",
+                    '"transparencyLogIndex": 1847300',
+                    f'"transparencyLogIndex": {LONG_INTEGER}',
+                )
+            }
+        )
+        self.assertEqual(code, 1)
+        observed = [ln.strip() for ln in lines if ln.strip().startswith("observed:")]
+        self.assertEqual(len(observed), 1, lines[:3])
+        self.assertTrue(observed[0].startswith("observed: REJECT[PARSE_ERROR: revocationList."), observed[0][:200])
+
+
+class UnexpectedExceptionTest(unittest.TestCase):
+    """An exception other than the ValueError and OverflowError a payload
+    value raises is a defect in the verifier, not a PARSE_ERROR verdict:
+    verify_fixture lets it propagate and main reports it with no verdict
+    and goes on to the next fixture."""
+
+    def test_unexpected_exception_is_not_a_verdict(self) -> None:
+        def broken(fixture: dict[str, Any]) -> verify.VerifyResult:
+            raise KeyError("boom")
+
+        with unittest.mock.patch.object(verify, "verify_sth", broken):
+            with self.assertRaises(KeyError):
+                verify.verify_fixture(load("transparency-log-sth.json"))
+            code, lines = run_main(
+                {
+                    "a-sth.json": (FIXTURES / "transparency-log-sth.json").read_text(),
+                    "b-valid.json": (FIXTURES / "revocation-list-valid.json").read_text(),
+                }
+            )
+        self.assertEqual(code, 1)
+        results = [ln for ln in lines if ln.startswith(("PASS", "FAIL"))]
+        self.assertEqual([ln.split()[0] for ln in results], ["FAIL", "PASS"])
+        self.assertIn("(verifier error: KeyError: 'boom')", results[0])
+        self.assertEqual(lines[-1], "summary: 1 pass, 1 fail (2 fixtures)")
 
 
 if __name__ == "__main__":
