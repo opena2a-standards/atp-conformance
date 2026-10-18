@@ -379,6 +379,55 @@ class CaseVariantMemberTest(unittest.TestCase):
                 self.assertEqual("ACCEPT" if got.accepted else got.reject_category, want, str(got))
 
 
+# One member of a committed fixture's verifierState, the verifier
+# configuration, left out (literal "") or replaced by the JSON literal, with
+# the outcome both verifiers return: ACCEPT, the REJECT category, or "load
+# error". ../go/verify_test.go holds the same table.
+VERIFIER_STATE_MEMBERS: list[tuple[str, str, str, str]] = [
+    ("transparency-log-sth.json", "verifierState", "", "SIGNATURE_INVALID"),
+    ("transparency-log-sth.json", "verifierState", "null", "SIGNATURE_INVALID"),
+    ("transparency-log-sth.json", "verifierState.publicKeys", "", "SIGNATURE_INVALID"),
+    ("transparency-log-sth.json", "verifierState.publicKeys", "null", "SIGNATURE_INVALID"),
+    ("transparency-log-sth.json", "verifierState.publicKeys.0.publicKeyHex", "", "SIGNATURE_INVALID"),
+    ("transparency-log-sth.json", "verifierState.publicKeys.0.publicKeyHex", "null", "SIGNATURE_INVALID"),
+    ("transparency-log-sth.json", "verifierState.publicKeys.0.algorithm", "", "SIGNATURE_INVALID"),
+    ("trust-proof-baseline.json", "verifierState", "", "VERIFIER_CONFIG_ERROR"),
+    ("trust-proof-baseline.json", "verifierState.clockRfc3339", "", "VERIFIER_CONFIG_ERROR"),
+    ("trust-proof-baseline.json", "verifierState.clockRfc3339", "null", "VERIFIER_CONFIG_ERROR"),
+    ("trust-proof-baseline.json", "verifierState.trustedIssuers", "", "UNTRUSTED_ISSUER"),
+    ("discovery-valid.json", "verifierState", "", "UNTRUSTED_ISSUER"),
+    ("discovery-valid.json", "verifierState.trustedIssuers.0", "null", "UNTRUSTED_ISSUER"),
+    ("transparency-inclusion-proof-valid.json", "verifierState", "", "SIGNATURE_INVALID"),
+    ("transparency-consistency-proof-valid.json", "verifierState", "", "SIGNATURE_INVALID"),
+    ("transparency-log-sth.json", "verifierState", '"x"', "load error"),
+    ("transparency-log-sth.json", "verifierState.publicKeys", "{}", "load error"),
+    ("transparency-log-sth.json", "verifierState.publicKeys.0.publicKeyHex", "5", "load error"),
+    ("trust-proof-baseline.json", "verifierState.clockRfc3339", "5", "load error"),
+]
+
+
+class VerifierStateMemberTest(unittest.TestCase):
+    """verifierState is decoded the way the Go verifier's encoding/json
+    decodes it: an absent or null member is its zero value, which the
+    verification steps then judge (no clock, no trusted issuer, no public
+    key), and a member of the wrong JSON type is a load error. The reason
+    names no Python exception. The unmodified fixtures verify ACCEPT
+    (SchemaTypeViolationTest checks each one)."""
+
+    def test_verifier_state_member(self) -> None:
+        for name, path, literal, want in VERIFIER_STATE_MEMBERS:
+            with self.subTest(fixture=name, path=path, value=literal):
+                doc = with_member(load(name), path, literal) if literal else renamed(load(name), path, "")
+                try:
+                    fixture = verify.parse_fixture(json.dumps(doc))
+                except ValueError as exc:
+                    self.assertEqual(want, "load error", str(exc))
+                    continue
+                got = verify.verify_fixture(fixture)
+                self.assertEqual("ACCEPT" if got.accepted else got.reject_category, want, str(got))
+                self.assertNotRegex(got.reason, r"\w+Error: ")
+
+
 class FixtureDocumentTest(unittest.TestCase):
     """parse_fixture refuses at load time what the Go verifier's decoder
     refuses: the NaN / Infinity extensions and a document that is not a
