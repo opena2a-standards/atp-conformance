@@ -17,6 +17,10 @@ Spec coverage:
   - repeated member names: a JSON object that repeats a member name is
     REJECT[PARSE_ERROR] naming the member inside a payload member, and a
     load error elsewhere in the fixture document, as in the Go verifier
+  - trust-proof timestamps: an issuedAt or expiresAt whose date as written
+    or whose UTC equivalent falls outside the years 1 to 9999 is
+    REJECT[PARSE_ERROR] at the step that reads it, and such a verifier
+    clockRfc3339 is REJECT[VERIFIER_CONFIG_ERROR], as in the Go verifier
 
 Out of scope:
   - ML-DSA-65 verification. The post-quantum Python library landscape is
@@ -119,6 +123,23 @@ def _parse_rfc3339_strict(value: str) -> datetime:
     if dt.tzinfo is None:
         raise ValueError("missing zone designator")
     return dt
+
+
+def _parse_timestamp(value: str) -> datetime:
+    """A trust proof's issuedAt or expiresAt, or the verifier's clockRfc3339,
+    in UTC. Raises ValueError for a time whose date as written or whose UTC
+    equivalent falls outside the years 1 to 9999 that datetime holds:
+    fromisoformat refuses a date written in year 0000, and astimezone raises
+    OverflowError, turned into ValueError here, for 0001-01-01T00:00:00+01:00
+    (0000-12-31T23:00:00Z) or 9999-12-31T23:59:59-01:00
+    (10000-01-01T00:59:59Z). Go's time package reads such a time, and the Go
+    verifier's parseTimestamp refuses it as well, so neither verifier
+    verifies it."""
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    try:
+        return parsed.astimezone(timezone.utc)
+    except OverflowError:
+        raise ValueError(f"{value} falls outside the years 1 to 9999 in UTC") from None
 
 
 def index_public_keys(refs: list[dict[str, Any]]):
@@ -603,13 +624,14 @@ def verify_trust_proof(fixture: dict[str, Any]) -> VerifyResult:
         )
     vs = _verifier_state(fixture)
     try:
-        now = _parse_rfc3339_strict(vs["clockRfc3339"]).astimezone(timezone.utc)
-    except (ValueError, OverflowError) as exc:
+        _parse_rfc3339_strict(vs["clockRfc3339"])
+        now = _parse_timestamp(vs["clockRfc3339"])
+    except ValueError as exc:
         return VerifyResult(reject_category="VERIFIER_CONFIG_ERROR", reason=f"bad clockRfc3339: {exc}")
 
     # Step 1: expiry.
     try:
-        expires = datetime.fromisoformat(tp["expiresAt"].replace("Z", "+00:00")).astimezone(timezone.utc)
+        expires = _parse_timestamp(tp["expiresAt"])
     except ValueError as exc:
         return VerifyResult(reject_category="PARSE_ERROR", reason=f"bad expiresAt: {exc}")
     if now > expires:
@@ -635,7 +657,7 @@ def verify_trust_proof(fixture: dict[str, Any]) -> VerifyResult:
     if tp["verdict"] not in VALID_VERDICTS:
         return VerifyResult(reject_category="SEMANTIC_INVALID", reason=f"verdict {tp['verdict']} not in {sorted(VALID_VERDICTS)}")
     try:
-        issued = datetime.fromisoformat(tp["issuedAt"].replace("Z", "+00:00")).astimezone(timezone.utc)
+        issued = _parse_timestamp(tp["issuedAt"])
     except ValueError as exc:
         return VerifyResult(reject_category="PARSE_ERROR", reason=f"bad issuedAt: {exc}")
     if issued >= expires:
@@ -954,6 +976,10 @@ def verify_fixture(fixture: dict[str, Any]) -> VerifyResult:
     # abort the run. A verifierState member of the wrong type is a
     # VERIFIER_CONFIG_ERROR. Any other exception is a defect in this verifier
     # and propagates; main reports it as a verifier error with no verdict.
+    # The OverflowError that astimezone raises for a trust-proof timestamp
+    # whose UTC equivalent falls outside the years 1 to 9999 does not reach
+    # here: _parse_timestamp turns it into a ValueError, which
+    # verify_trust_proof reports with a reason naming the member.
     try:
         return _verify_fixture(fixture)
     except VerifierStateError as exc:
