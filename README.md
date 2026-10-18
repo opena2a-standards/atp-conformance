@@ -87,6 +87,12 @@ years 1 to 9999 is refused by both at the step that reads it:
 `REJECT[PARSE_ERROR]` for the proof's timestamps and
 `REJECT[VERIFIER_CONFIG_ERROR]` for the clock
 ([rule](docs/how-it-works.md#trust-proof-timestamps-both-verifiers-read-the-years-1-to-9999)).
+Both read a timestamp only as an RFC 3339 date-time with an upper-case `T`
+and `Z`
+([rule](docs/how-it-works.md#timestamps-both-verifiers-read-rfc-3339-date-times-only))
+and a hex value only as an even number of hex digits
+([rule](docs/how-it-works.md#hex-values-both-verifiers-read-hex-digits-only)),
+and refuse a string outside those forms at the step that reads it.
 
 ## Scope
 

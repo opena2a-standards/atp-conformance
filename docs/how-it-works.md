@@ -193,6 +193,60 @@ baseline proof is `EXPIRED`. The `timestampRangeEdges` table in
 [`verifiers/python/test_verify.py`](../verifiers/python/test_verify.py)
 hold the same cases for both verifiers.
 
+### Timestamps: both verifiers read RFC 3339 date-times only
+
+Both verifiers read a timestamp only as an RFC 3339 §5.6 `date-time` with
+the `T` and `Z` in upper case, as Go's `time.RFC3339` layout writes them:
+`YYYY-MM-DDThh:mm:ss`, an optional fraction of one or more digits after
+`.`, then `Z` or a `+hh:mm` or `-hh:mm` offset, with a year from 0001, an
+hour and an offset hour of at most 23, an offset minute of at most 59, and
+a date and time of day that exist (no `2026-02-29`, no second 60). That
+holds for a trust proof's `issuedAt` and `expiresAt`, a tree head's
+`timestamp`, a revocation list's `nextSince` and each entry's `revokedAt`,
+and the verifier's `clockRfc3339`. On its own, Python's
+`datetime.fromisoformat` also reads strings outside that grammar, such as
+`2026-05-24 00:00:00Z`, `20260524T000000Z`, `2026-05-24T00:00:00+01` and a
+timestamp with no zone, and Go's `time.Parse` with the RFC 3339 layout
+also reads `2026-05-24T0:00:00Z`, `2026-05-24T00:00:00,5Z`,
+`2026-05-24T00:00:00+24:00` and `0000-01-01T00:00:00Z`. RFC 3339 also
+allows a lower-case `t` and `z`, which `time.Parse` refuses. Both
+verifiers refuse a string outside the grammar at the step that reads it:
+
+- a trust proof's or a revocation list's timestamp is
+  `REJECT[PARSE_ERROR]`;
+- a tree head's `timestamp` is `REJECT[STH_INVALID]`;
+- `clockRfc3339` is `REJECT[VERIFIER_CONFIG_ERROR]`.
+
+The `notRFC3339` and `rfc3339DateTimes` lists in
+[`verifiers/go/verify_test.go`](../verifiers/go/verify_test.go) and the
+`NOT_RFC3339` and `RFC3339_DATE_TIMES` lists in
+[`verifiers/python/test_verify.py`](../verifiers/python/test_verify.py)
+hold the same cases for both verifiers, each refused string with the
+parser that reads it on its own.
+
+### Hex values: both verifiers read hex digits only
+
+Both verifiers read a hex value as Go's `hex.DecodeString` reads it: an
+even number of hex digits in either case, and nothing else. That holds
+for a `publicKeyHex` in `verifierState` or in a discovery response, for a
+tree head's `rootHash`, and for a proof's `leafHash` and path hashes after
+the `SHA256:` prefix. Python's `bytes.fromhex` on its own skips ASCII
+whitespace between bytes, which `hex.DecodeString` refuses, and the Python
+verifier refuses it as well:
+
+- a configured Ed25519 `publicKeyHex` with whitespace in it is skipped,
+  so a signature that only that key verifies is
+  `REJECT[SIGNATURE_INVALID]`;
+- whitespace in a tree head's `rootHash` is `REJECT[STH_INVALID]`, in a
+  `leafHash` or a path hash `REJECT[PARSE_ERROR]`, and in a discovery
+  response's `publicKeyHex` `REJECT[DISCOVERY_INVALID]`.
+
+The `hexMembers` table in
+[`verifiers/go/verify_test.go`](../verifiers/go/verify_test.go) and the
+`HEX_MEMBERS` table in
+[`verifiers/python/test_verify.py`](../verifiers/python/test_verify.py)
+hold the same cases for both verifiers.
+
 ### Verifier configuration: `verifierState` decodes to zero values
 
 `verifierState` is the verifier's configuration (its clock, trusted
@@ -214,6 +268,22 @@ verifier's `encoding/json` decode does:
 The `verifierStateMembers` table in
 [`verifiers/go/verify_test.go`](../verifiers/go/verify_test.go) and the
 `VERIFIER_STATE_MEMBERS` table in
+[`verifiers/python/test_verify.py`](../verifiers/python/test_verify.py)
+hold the same cases for both verifiers.
+
+### Fixture members: both verifiers decode them with the Go types
+
+Both verifiers decode `name`, `description`, `fixtureType`,
+`keypairRefs` and `expected` the way they decode `verifierState`, with the
+types of the Go verifier's fixture struct: `name`, `description` and
+`fixtureType` are strings, `keypairRefs` is an array of objects of
+strings, and `expected` is an object of strings. A member of the wrong
+JSON type, such as a number for `name` or an array for `expected`, is a
+load error in both verifiers, and an absent or `null` member is its zero
+value. Members neither verifier reads, such as `$schema` and `spec`, are
+ignored. The `fixtureMembers` table in
+[`verifiers/go/verify_test.go`](../verifiers/go/verify_test.go) and the
+`FIXTURE_MEMBERS` table in
 [`verifiers/python/test_verify.py`](../verifiers/python/test_verify.py)
 hold the same cases for both verifiers.
 
