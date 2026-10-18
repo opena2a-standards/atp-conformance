@@ -236,7 +236,12 @@ var rfc3339DateTime = regexp.MustCompile(`^([0-9]{4})-[0-9]{2}-[0-9]{2}T([0-9]{2
 // the year 0000, which time.Parse reads and Python's datetime does not
 // hold, an hour above 23 (from Python 3.14, fromisoformat reads 24:00:00 as
 // the next midnight), and an offset hour above 23 or minute above 59.
-// time.Parse then checks the month, day, minute and second.
+// time.Parse then checks the month, day, minute and second. It keeps the
+// first nine digits of a fraction (nanoseconds), where fromisoformat keeps
+// six (microseconds, the precision Python's datetime holds), each dropping
+// the digits after them. The time is truncated to the microsecond, so both
+// verifiers read 2026-05-24T06:00:00.0000001Z as 06:00:00 and compare the
+// same times.
 func parseRFC3339(s string) (time.Time, error) {
 	m := rfc3339DateTime.FindStringSubmatch(s)
 	if m == nil {
@@ -252,7 +257,11 @@ func parseRFC3339(s string) (time.Time, error) {
 	if offsetHour > "23" || offsetMinute > "59" {
 		return time.Time{}, fmt.Errorf("%q has a zone offset hour above 23 or minute above 59", s)
 	}
-	return time.Parse(time.RFC3339, s)
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return t.Truncate(time.Microsecond), nil
 }
 
 // parseTimestamp reads a trust proof's issuedAt or expiresAt, or the

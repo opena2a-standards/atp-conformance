@@ -25,6 +25,9 @@ Spec coverage:
     included, is read only as an RFC 3339 date-time with an upper-case T
     and Z (_parse_rfc3339_strict, the Go verifier's parseRFC3339), and a
     string outside that grammar is refused at the step that reads it
+  - fractions of a second: a timestamp is read to the microsecond, any
+    digit of its fraction after the sixth dropped, as the Go verifier
+    reads it, so both verifiers compare the same times
   - hex: a hex value is read only as an even number of hex digits
     (_hex_bytes, as Go's hex.DecodeString reads it), so whitespace in a
     configured Ed25519 public key, a published key or a wire hash is not
@@ -166,7 +169,12 @@ def _parse_rfc3339_strict(value: str) -> datetime:
     checks after it refuse the year 0000, which datetime does not hold and
     Go's time.Parse reads, an hour above 23, and an offset hour above 23 or
     minute above 59, which Go's time.Parse reads at 24 and 60.
-    fromisoformat then checks the month, day, minute and second."""
+    fromisoformat then checks the month, day, minute and second. From
+    Python 3.11 it keeps the first six digits of a fraction (microseconds,
+    the precision datetime holds) and drops the digits after them, and the
+    Go verifier's parseRFC3339 truncates its time to the microsecond, so
+    both verifiers read 2026-05-24T06:00:00.0000001Z as 06:00:00 and
+    compare the same times."""
     match = _RFC3339_DATE_TIME.fullmatch(value)
     if match is None:
         raise ValueError(f"{value!r} is not in the RFC 3339 form YYYY-MM-DDThh:mm:ss[.digits](Z|+hh:mm|-hh:mm)")

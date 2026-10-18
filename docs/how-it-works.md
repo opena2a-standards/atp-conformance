@@ -224,6 +224,40 @@ The `notRFC3339` and `rfc3339DateTimes` lists in
 hold the same cases for both verifiers, each refused string with the
 parser that reads it on its own.
 
+### Fractions of a second: both verifiers read microseconds
+
+Both verifiers read a timestamp to the microsecond: the first six digits
+of a fraction of a second count, and any digit after the sixth is dropped,
+not rounded, so `2026-05-24T06:00:00.0000009Z` is read as
+`2026-05-24T06:00:00Z`. Python's `datetime` holds microseconds, and
+`datetime.fromisoformat` drops the digits after the sixth (in Python 3.11
+or later, which the README requires; Python 3.10 refuses such a
+fraction). Go's `time.Parse` keeps nine digits (nanoseconds), so the Go
+verifier truncates the time it reads to the microsecond. Read to two precisions, one string
+would be two different times, and a step that compares times could return
+a different verdict in each verifier. Three steps compare times: the
+expiry check (the verifier's `clockRfc3339` against `expiresAt`), the
+check that `issuedAt` is before `expiresAt`, and the 24-hour validity
+window. With the baseline proof, which expires at `2026-05-24T06:00:00Z`,
+18 hours after its `issuedAt`, both verifiers return:
+
+- `ACCEPT` with `clockRfc3339` set to `2026-05-24T06:00:00.0000001Z`,
+  which is read as the expiry time, and `EXPIRED` with
+  `2026-05-24T06:00:00.000001Z`, a microsecond after it;
+- `SIGNATURE_INVALID` with `expiresAt` set to
+  `2026-05-24T12:00:00.0000001Z`: the window is read as exactly 24 hours,
+  which the window check allows, and the signed form, which writes each
+  timestamp to the whole second, then holds `2026-05-24T12:00:00Z`, not
+  the `2026-05-24T06:00:00Z` the signature covers. With
+  `2026-05-24T12:00:00.000001Z`, a window a microsecond over 24 hours, it
+  is `SEMANTIC_INVALID`.
+
+The `subMicrosecondTimestamps` table in
+[`verifiers/go/verify_test.go`](../verifiers/go/verify_test.go) and the
+`SUB_MICROSECOND_TIMESTAMPS` table in
+[`verifiers/python/test_verify.py`](../verifiers/python/test_verify.py)
+hold the same cases for both verifiers.
+
 ### Hex values: both verifiers read hex digits only
 
 Both verifiers read a hex value as Go's `hex.DecodeString` reads it: an
