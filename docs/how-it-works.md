@@ -135,6 +135,34 @@ fixture set. The regression tables in
 [`verifiers/python/test_verify.py`](../verifiers/python/test_verify.py)
 hold the same cases for both verifiers.
 
+### Repeated member names: both verifiers refuse them
+
+RFC 8259 §4 leaves the meaning of a member name that one JSON object
+repeats to the receiver, and the two verifiers' JSON decoders read it
+differently: Go's `encoding/json` decodes the occurrences into the same
+field one after another, so the members of an earlier object occurrence
+survive and the first type error is the one reported, while Python's
+`json.loads` keeps only the last occurrence. So
+`"treeSize": "x", "treeSize": 1847294` in a Signed Tree Head would be a
+type error to one verifier and a valid tree size to the other. Both
+verifiers refuse a repeated name instead, whatever the values are, as
+RFC 7493 §2.3 requires of I-JSON:
+
+- a repeat inside a payload member, including in a member neither
+  verifier reads, is `REJECT[PARSE_ERROR]` naming the first repeated
+  member in document order, for example
+  `signedTreeHead.treeSize: duplicate member name`;
+- a repeat elsewhere in the fixture document, such as in `verifierState`
+  or `expected`, or a payload member written twice at the top level, is a
+  load error with the same text, because the verifier configuration or the
+  expected outcome then has more than one reading.
+
+The `repeatedNames` table in
+[`verifiers/go/verify_test.go`](../verifiers/go/verify_test.go) and the
+`REPEATED_NAMES` table in
+[`verifiers/python/test_verify.py`](../verifiers/python/test_verify.py)
+hold the same cases for both verifiers.
+
 ## The fixture generator
 
 The README's [Reproducing the fixtures](../README.md#reproducing-the-fixtures)

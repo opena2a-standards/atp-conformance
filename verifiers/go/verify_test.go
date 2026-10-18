@@ -412,6 +412,68 @@ func TestCaseVariantMemberIsAbsent(t *testing.T) {
 	}
 }
 
+// repeatedNames writes a member name twice into one JSON object of a
+// committed ACCEPT fixture: old occurs once in the file and new replaces it.
+// Inside a payload member the repeat is REJECT[PARSE_ERROR] naming the first
+// repeated member in document order, whatever the values are; anywhere else
+// in the document it is a load error. ../python/test_verify.py holds the
+// same table.
+var repeatedNames = []struct {
+	fixture, old, new, member string
+	loadError                 bool
+}{
+	{"transparency-log-sth.json", `"treeSize": 1847294,`, `"treeSize": "x", "treeSize": 1847294,`, "signedTreeHead.treeSize", false},
+	{"transparency-log-sth.json", `"treeSize": 1847294,`, `"treeSize": 1847294, "treeSize": "x",`, "signedTreeHead.treeSize", false},
+	{"transparency-log-sth.json", `"treeSize": 1847294,`, `"treeSize": 0, "treeSize": 1847294,`, "signedTreeHead.treeSize", false},
+	{"transparency-log-sth.json", `"treeSize": 1847294,`, `"treeSize": 1847294, "treeSize": 1847294,`, "signedTreeHead.treeSize", false},
+	{"transparency-log-sth.json", `"treeSize": 1847294,`, `"note": {"a": 1, "a": 2}, "treeSize": 1847294,`, "signedTreeHead.note.a", false},
+	{"transparency-log-sth.json", `"treeSize": 1847294,`, `"note": {"b": 1, "b": 2}, "note": 3, "treeSize": 1847294,`, "signedTreeHead.note.b", false},
+	{"transparency-log-sth.json", `"treeSize": 1847294,`, `"note": 3, "note": {"b": 1, "b": 2}, "treeSize": 1847294,`, "signedTreeHead.note", false},
+	{"transparency-log-sth.json", `"treeSize": 1847294,`, `"note": 1e400, "treeSize": 1847294, "treeSize": 1847294,`, "signedTreeHead.treeSize", false},
+	{"trust-proof-baseline.json", `"trustLevel": 3,`, `"trustLevel": 4, "trustLevel": 3,`, "trustProof.trustLevel", false},
+	{"revocation-list-valid.json", `"reason": "Supply chain compromise detected",`, `"reason": "", "reason": "Supply chain compromise detected",`, "revocationList.revocations[0].reason", false},
+	{"transparency-inclusion-proof-valid.json", `"treeSize": 8,`, `"treeSize": 8, "treeSize": 8,`, "inclusionProof.signedTreeHead.treeSize", false},
+	{"transparency-consistency-proof-valid.json", `"fromSize": 4,`, `"fromSize": 4, "fromSize": 4,`, "consistencyProof.fromSize", false},
+	{"discovery-valid.json", `"trustProof": "/api/v1/trust/proof",`, `"trustProof": "/x", "trustProof": "/api/v1/trust/proof",`, "discoveryResponse.endpoints.trustProof", false},
+	{"transparency-log-sth.json", `"expected": {`, `"verifierState": {"clockRfc3339": "2026-05-24T00:00:00Z"}, "expected": {`, "verifierState", true},
+	{"transparency-log-sth.json", `"clockRfc3339": "2026-05-24T00:00:00Z",`, `"clockRfc3339": "2026-05-24T00:00:00Z", "clockRfc3339": "2026-05-24T00:00:00Z",`, "verifierState.clockRfc3339", true},
+	{"transparency-log-sth.json", `"verifyResult": "ACCEPT"`, `"verifyResult": "REJECT", "verifyResult": "ACCEPT"`, "expected.verifyResult", true},
+	{"transparency-log-sth.json", `"signedTreeHead": {`, `"signedTreeHead": {}, "signedTreeHead": {`, "signedTreeHead", true},
+}
+
+// TestRepeatedMemberName: encoding/json and Python's json.loads read a
+// repeated member name differently, so both verifiers refuse it with the
+// same text: REJECT[PARSE_ERROR] inside a payload member and a load error
+// elsewhere. The unmodified fixtures verify ACCEPT
+// (TestSchemaTypeViolationIsParseError checks each one).
+func TestRepeatedMemberName(t *testing.T) {
+	for _, tc := range repeatedNames {
+		t.Run(tc.member, func(t *testing.T) {
+			doc, err := os.ReadFile(filepath.Join("..", "..", "fixtures", tc.fixture))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n := strings.Count(string(doc), tc.old); n != 1 {
+				t.Fatalf("%s holds %q %d times, want once", tc.fixture, tc.old, n)
+			}
+			f, err := parseFixture([]byte(strings.Replace(string(doc), tc.old, tc.new, 1)))
+			want := tc.member + ": duplicate member name"
+			if tc.loadError {
+				if err == nil || err.Error() != want {
+					t.Fatalf("load error %v, want %q", err, want)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("load error %v, want REJECT[PARSE_ERROR: %s]", err, want)
+			}
+			if got := verify(f); got.Accepted || got.RejectCategory != "PARSE_ERROR" || got.Reason != want {
+				t.Fatalf("got %s, want REJECT[PARSE_ERROR: %s]", got, want)
+			}
+		})
+	}
+}
+
 // TestExactMembers: a member whose name is not exactly a field's JSON name
 // is left out, the members kept stay in document order with repeated names
 // included, a map key is kept as written, a payload member of the fixture

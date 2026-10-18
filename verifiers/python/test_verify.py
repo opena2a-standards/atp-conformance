@@ -15,6 +15,7 @@ import contextlib
 import copy
 import io
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -399,7 +400,8 @@ class FixtureDocumentTest(unittest.TestCase):
 
 def fixture_text_with(name: str, old: str, new: str) -> str:
     """The text of a committed fixture with one literal replaced, for a value
-    a fixture file can carry but json.dumps does not write (1e400)."""
+    a fixture file can carry but json.dumps does not write (1e400) or a
+    member name repeated in one JSON object."""
     text = (FIXTURES / name).read_text()
     if text.count(old) != 1:
         raise AssertionError(f"{old!r} does not occur exactly once in {name}")
@@ -470,6 +472,69 @@ class OverflowErrorTest(unittest.TestCase):
             self.assertIn(wanted, got)
         self.assertEqual(observed[-1], "observed: ACCEPT")
         self.assertEqual(lines[-1], "summary: 1 pass, 4 fail (5 fixtures)")
+
+
+# A member name written twice into one JSON object of a committed ACCEPT
+# fixture: old occurs once in the file and new replaces it. Inside a payload
+# member the repeat is REJECT[PARSE_ERROR] naming the first repeated member
+# in document order, whatever the values are; anywhere else in the document
+# it is a load error. ../go/verify_test.go holds the same table.
+REPEATED_NAMES: list[tuple[str, str, str, str, bool]] = [
+    ("transparency-log-sth.json", '"treeSize": 1847294,', '"treeSize": "x", "treeSize": 1847294,', "signedTreeHead.treeSize", False),
+    ("transparency-log-sth.json", '"treeSize": 1847294,', '"treeSize": 1847294, "treeSize": "x",', "signedTreeHead.treeSize", False),
+    ("transparency-log-sth.json", '"treeSize": 1847294,', '"treeSize": 0, "treeSize": 1847294,', "signedTreeHead.treeSize", False),
+    ("transparency-log-sth.json", '"treeSize": 1847294,', '"treeSize": 1847294, "treeSize": 1847294,', "signedTreeHead.treeSize", False),
+    ("transparency-log-sth.json", '"treeSize": 1847294,', '"note": {"a": 1, "a": 2}, "treeSize": 1847294,', "signedTreeHead.note.a", False),
+    ("transparency-log-sth.json", '"treeSize": 1847294,', '"note": {"b": 1, "b": 2}, "note": 3, "treeSize": 1847294,', "signedTreeHead.note.b", False),
+    ("transparency-log-sth.json", '"treeSize": 1847294,', '"note": 3, "note": {"b": 1, "b": 2}, "treeSize": 1847294,', "signedTreeHead.note", False),
+    ("transparency-log-sth.json", '"treeSize": 1847294,', '"note": 1e400, "treeSize": 1847294, "treeSize": 1847294,', "signedTreeHead.treeSize", False),
+    ("trust-proof-baseline.json", '"trustLevel": 3,', '"trustLevel": 4, "trustLevel": 3,', "trustProof.trustLevel", False),
+    ("revocation-list-valid.json", '"reason": "Supply chain compromise detected",', '"reason": "", "reason": "Supply chain compromise detected",', "revocationList.revocations[0].reason", False),
+    ("transparency-inclusion-proof-valid.json", '"treeSize": 8,', '"treeSize": 8, "treeSize": 8,', "inclusionProof.signedTreeHead.treeSize", False),
+    ("transparency-consistency-proof-valid.json", '"fromSize": 4,', '"fromSize": 4, "fromSize": 4,', "consistencyProof.fromSize", False),
+    ("discovery-valid.json", '"trustProof": "/api/v1/trust/proof",', '"trustProof": "/x", "trustProof": "/api/v1/trust/proof",', "discoveryResponse.endpoints.trustProof", False),
+    ("transparency-log-sth.json", '"expected": {', '"verifierState": {"clockRfc3339": "2026-05-24T00:00:00Z"}, "expected": {', "verifierState", True),
+    ("transparency-log-sth.json", '"clockRfc3339": "2026-05-24T00:00:00Z",', '"clockRfc3339": "2026-05-24T00:00:00Z", "clockRfc3339": "2026-05-24T00:00:00Z",', "verifierState.clockRfc3339", True),
+    ("transparency-log-sth.json", '"verifyResult": "ACCEPT"', '"verifyResult": "REJECT", "verifyResult": "ACCEPT"', "expected.verifyResult", True),
+    ("transparency-log-sth.json", '"signedTreeHead": {', '"signedTreeHead": {}, "signedTreeHead": {', "signedTreeHead", True),
+]
+
+
+class RepeatedMemberNameTest(unittest.TestCase):
+    """json.loads and the Go verifier's encoding/json read a repeated member
+    name differently, so both verifiers refuse it with the same text:
+    REJECT[PARSE_ERROR] inside a payload member and a load error elsewhere.
+    The unmodified fixtures verify ACCEPT (SchemaTypeViolationTest checks
+    each one)."""
+
+    def test_repeated_member_name(self) -> None:
+        for name, old, new, member, load_error in REPEATED_NAMES:
+            with self.subTest(fixture=name, new=new):
+                text = fixture_text_with(name, old, new)
+                want = f"{member}: duplicate member name"
+                if load_error:
+                    with self.assertRaises(ValueError) as caught:
+                        verify.parse_fixture(text)
+                    self.assertEqual(str(caught.exception), want)
+                else:
+                    got = verify.verify_fixture(verify.parse_fixture(text))
+                    self.assertFalse(got.accepted, str(got))
+                    self.assertEqual(got.reject_category, "PARSE_ERROR", str(got))
+                    self.assertEqual(got.reason, want)
+
+    def test_repeat_nested_past_the_recursion_limit(self) -> None:
+        depth = sys.getrecursionlimit() + 100
+        note = "[" * depth + '{"a": 1, "a": 2}' + "]" * depth
+        text = fixture_text_with(
+            "transparency-log-sth.json", '"treeSize": 1847294,', f'"note": {note}, "treeSize": 1847294,'
+        )
+        try:
+            doc = verify.parse_fixture(text)
+        except RecursionError:
+            self.skipTest("json.loads on this interpreter does not read the document")
+        got = verify.verify_fixture(doc)
+        self.assertEqual(got.reject_category, "PARSE_ERROR", str(got)[:200])
+        self.assertEqual(got.reason, "signedTreeHead.note" + "[0]" * depth + ".a: duplicate member name")
 
 
 if __name__ == "__main__":

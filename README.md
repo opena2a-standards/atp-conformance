@@ -77,6 +77,10 @@ Both verifiers decode each payload member against the JSON type the
 vendored schema gives it before verifying, so a member of the wrong type
 or range is `REJECT[PARSE_ERROR]` in both; the rule is in
 [docs/how-it-works.md](docs/how-it-works.md#wire-types-both-verifiers-decode-before-they-verify).
+A JSON object that repeats a member name is refused by both:
+`REJECT[PARSE_ERROR]` inside a payload member and a load error elsewhere
+in the fixture
+([rule](docs/how-it-works.md#repeated-member-names-both-verifiers-refuse-them)).
 
 ## Scope
 
