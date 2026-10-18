@@ -21,9 +21,18 @@ Spec coverage:
     or whose UTC equivalent falls outside the years 1 to 9999 is
     REJECT[PARSE_ERROR] at the step that reads it, and such a verifier
     clockRfc3339 is REJECT[VERIFIER_CONFIG_ERROR], as in the Go verifier
-  - verifier state: verifierState is decoded with the Go verifier's
-    encoding/json rules, so an absent or null member is its zero value and
-    a member of the wrong JSON type is a load error
+  - timestamp grammar: each timestamp, the verifier's clockRfc3339
+    included, is read only as an RFC 3339 date-time with an upper-case T
+    and Z (_parse_rfc3339_strict, the Go verifier's parseRFC3339), and a
+    string outside that grammar is refused at the step that reads it
+  - hex: a hex value is read only as an even number of hex digits
+    (_hex_bytes, as Go's hex.DecodeString reads it), so whitespace in a
+    configured Ed25519 public key, a published key or a wire hash is not
+    skipped
+  - verifier state and fixture members: verifierState, name, description,
+    fixtureType, keypairRefs and expected are decoded with the Go
+    verifier's encoding/json rules, so an absent or null member is its zero
+    value and a member of the wrong JSON type is a load error
 
 Out of scope:
   - ML-DSA-65 verification. The post-quantum Python library landscape is
@@ -47,6 +56,7 @@ import base64
 import hashlib
 import json
 import math
+import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -101,10 +111,27 @@ def canonical_proof_payload(tp: dict[str, Any]) -> bytes:
     ).encode("utf-8")
 
 
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def _hex_bytes(text: str) -> bytes:
+    """text decoded the way the Go verifier's hex.DecodeString decodes it: an
+    even number of hex digits, in either case, and nothing else.
+    bytes.fromhex alone also skips ASCII whitespace between bytes, which
+    hex.DecodeString refuses, so a key or hash with a space in it would be
+    read here and refused by the Go verifier."""
+    for i, char in enumerate(text):
+        if char not in _HEX_DIGITS:
+            raise ValueError(f"invalid hex digit {char!r} at position {i}")
+    if len(text) % 2:
+        raise ValueError("odd number of hex digits")
+    return bytes.fromhex(text)
+
+
 def sth_signed_bytes(root_hash: str) -> bytes:
     """Literal reading of ATP §5.6: strip "SHA256:" prefix, hex-decode 32 raw bytes."""
     stripped = root_hash[len("SHA256:"):] if root_hash.startswith("SHA256:") else root_hash
-    raw = bytes.fromhex(stripped)
+    raw = _hex_bytes(stripped)
     if len(raw) != 32:
         raise ValueError(f"rootHash must decode to 32 bytes, got {len(raw)}")
     return raw
@@ -116,29 +143,55 @@ def _normalize_rfc3339(s: str) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# RFC 3339 §5.6 date-time with the "T" and "Z" in upper case, as Go's
+# time.RFC3339 layout writes them (RFC 3339 also allows them in lower case,
+# which Go's time.Parse refuses): a 4-digit year, a 2-digit month, day,
+# hour, minute and second, an optional fraction of one or more digits after
+# ".", and "Z" or a numeric offset. The groups are the year, the hour, and
+# the offset hour and minute. The Go verifier's rfc3339DateTime is the same
+# expression, anchored at both ends.
+_RFC3339_DATE_TIME = re.compile(
+    r"([0-9]{4})-[0-9]{2}-[0-9]{2}T([0-9]{2}):[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:Z|[+-]([0-9]{2}):([0-9]{2}))"
+)
+
+
 def _parse_rfc3339_strict(value: str) -> datetime:
-    # Python's fromisoformat accepts a space separator and zone-less
-    # timestamps; the wire rule is RFC 3339 (as Go's time.RFC3339 layout
-    # enforces), so require the 'T' separator and a zone designator.
-    if "T" not in value:
-        raise ValueError("missing 'T' date/time separator")
-    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if dt.tzinfo is None:
-        raise ValueError("missing zone designator")
-    return dt
+    """value read as an RFC 3339 date-time, with the checks of the Go
+    verifier's parseRFC3339 in the same order, so both verifiers read the
+    same strings. fromisoformat alone also reads ISO 8601 forms that are not
+    RFC 3339, such as a space or a lower-case t as the separator, the basic
+    format, a time without seconds, a week date, an offset without minutes
+    or with seconds, and no zone at all, and from Python 3.14 it reads
+    24:00:00 as the next midnight. The expression refuses the forms. The
+    checks after it refuse the year 0000, which datetime does not hold and
+    Go's time.Parse reads, an hour above 23, and an offset hour above 23 or
+    minute above 59, which Go's time.Parse reads at 24 and 60.
+    fromisoformat then checks the month, day, minute and second."""
+    match = _RFC3339_DATE_TIME.fullmatch(value)
+    if match is None:
+        raise ValueError(f"{value!r} is not in the RFC 3339 form YYYY-MM-DDThh:mm:ss[.digits](Z|+hh:mm|-hh:mm)")
+    year, hour, offset_hour, offset_minute = match.groups(default="")
+    if year == "0000":
+        raise ValueError(f"{value} falls outside the years 1 to 9999 as written")
+    if hour > "23":
+        raise ValueError(f"{value!r} has an hour above 23")
+    if offset_hour > "23" or offset_minute > "59":
+        raise ValueError(f"{value!r} has a zone offset hour above 23 or minute above 59")
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
 def _parse_timestamp(value: str) -> datetime:
     """A trust proof's issuedAt or expiresAt, or the verifier's clockRfc3339,
-    in UTC. Raises ValueError for a time whose date as written or whose UTC
+    read by _parse_rfc3339_strict, in UTC. Raises ValueError for a value
+    that is not an RFC 3339 date-time, or whose date as written or whose UTC
     equivalent falls outside the years 1 to 9999 that datetime holds:
-    fromisoformat refuses a date written in year 0000, and astimezone raises
-    OverflowError, turned into ValueError here, for 0001-01-01T00:00:00+01:00
-    (0000-12-31T23:00:00Z) or 9999-12-31T23:59:59-01:00
-    (10000-01-01T00:59:59Z). Go's time package reads such a time, and the Go
-    verifier's parseTimestamp refuses it as well, so neither verifier
-    verifies it."""
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    _parse_rfc3339_strict refuses a date written in year 0000, and
+    astimezone raises OverflowError, turned into ValueError here, for
+    0001-01-01T00:00:00+01:00 (0000-12-31T23:00:00Z) or
+    9999-12-31T23:59:59-01:00 (10000-01-01T00:59:59Z). Go's time package
+    reads such a time, and the Go verifier's parseTimestamp refuses it as
+    well, so neither verifier verifies it."""
+    parsed = _parse_rfc3339_strict(value)
     try:
         return parsed.astimezone(timezone.utc)
     except OverflowError:
@@ -146,15 +199,15 @@ def _parse_timestamp(value: str) -> datetime:
 
 
 def index_public_keys(refs: list[dict[str, Any]]):
-    # A configured key that is not hex or not 32 bytes is skipped, as the Go
-    # verifier's indexPublicKeys skips it: a signature then fails to verify
-    # against the remaining keys.
+    # A configured key that is not hex (as _hex_bytes reads it) or not 32
+    # bytes is skipped, as the Go verifier's indexPublicKeys skips it: a
+    # signature then fails to verify against the remaining keys.
     eds: list[Ed25519PublicKey] = []
     mldsa_present = False
     for r in refs:
         if r["algorithm"] == "Ed25519":
             try:
-                raw = bytes.fromhex(r["publicKeyHex"])
+                raw = _hex_bytes(r["publicKeyHex"])
             except ValueError:
                 continue
             if len(raw) != 32:
@@ -493,8 +546,8 @@ def _decode_payload(fixture: dict[str, Any], label: str, shape: dict[str, Any]) 
 # Neither is a PARSE_ERROR, which names a payload member.
 # ---------------------------------------------------------------------------
 
-# The members of one verifierState.publicKeys entry, as the Go verifier's
-# keypairRef struct names them.
+# The members of one verifierState.publicKeys or keypairRefs entry, as the
+# Go verifier's keypairRef struct names them.
 _KEYPAIR_REF_MEMBERS = ("role", "path", "algorithm", "publicKeyHex", "keyId")
 
 
@@ -502,12 +555,12 @@ class VerifierStateError(Exception):
     """A verifierState member whose JSON type does not fit the verifier's configuration."""
 
 
-def _state_value(label: str, value: Any, kind: type, word: str) -> Any:
+def _state_value(label: str, value: Any, kind: type, word: str, error: type[Exception] = VerifierStateError) -> Any:
     if value is None:
         return kind()
     if isinstance(value, kind):
         return value
-    raise VerifierStateError(f"{label}: JSON {_json_kind(value)} does not fit the {word} the verifier requires")
+    raise error(f"{label}: JSON {_json_kind(value)} does not fit the {word} the verifier requires")
 
 
 def _verifier_state(fixture: dict[str, Any]) -> dict[str, Any]:
@@ -531,6 +584,38 @@ def _verifier_state(fixture: dict[str, Any]) -> dict[str, Any]:
         ],
         "publicKeys": keys,
     }
+
+
+# ---------------------------------------------------------------------------
+# fixture members
+#
+# The Go verifier decodes the rest of the fixture document with
+# encoding/json too, into the typed fields of its fixture struct: name,
+# description and fixtureType strings, keypairRefs an array of keypairRef
+# objects, and expected an expectedOutcome object of strings. As in
+# verifierState, a member of the wrong JSON type is a load error and an
+# absent or null member is its zero value. parse_fixture applies the same
+# rules through _check_fixture_members.
+# ---------------------------------------------------------------------------
+
+# The members of expected, as the Go verifier's expectedOutcome struct names
+# them.
+_EXPECTED_MEMBERS = ("verifyResult", "rejectCategory", "reasonContains")
+
+
+def _check_fixture_members(fixture: dict[str, Any]) -> None:
+    """Checks name, description, fixtureType, keypairRefs and expected the
+    way the Go verifier decodes them. Raises ValueError naming the member."""
+    for member in ("name", "description", "fixtureType"):
+        _state_value(member, fixture.get(member), str, "string", ValueError)
+    refs = _state_value("keypairRefs", fixture.get("keypairRefs"), list, "array", ValueError)
+    for i, ref in enumerate(refs):
+        ref = _state_value(f"keypairRefs[{i}]", ref, dict, "object", ValueError)
+        for m in _KEYPAIR_REF_MEMBERS:
+            _state_value(f"keypairRefs[{i}].{m}", ref.get(m), str, "string", ValueError)
+    expected = _state_value("expected", fixture.get("expected"), dict, "object", ValueError)
+    for m in _EXPECTED_MEMBERS:
+        _state_value(f"expected.{m}", expected.get(m), str, "string", ValueError)
 
 
 # ---------------------------------------------------------------------------
@@ -573,7 +658,7 @@ def verify_discovery(fixture: dict[str, Any]) -> VerifyResult:
         algo = pk["algorithm"]
         if algo == "Ed25519":
             try:
-                raw = bytes.fromhex(pk["publicKeyHex"])
+                raw = _hex_bytes(pk["publicKeyHex"])
             except ValueError:
                 return VerifyResult(
                     reject_category="DISCOVERY_INVALID",
@@ -586,7 +671,7 @@ def verify_discovery(fixture: dict[str, Any]) -> VerifyResult:
                 )
         elif algo == "ML-DSA-65":
             try:
-                bytes.fromhex(pk["publicKeyHex"])
+                _hex_bytes(pk["publicKeyHex"])
             except ValueError:
                 return VerifyResult(
                     reject_category="DISCOVERY_INVALID",
@@ -627,7 +712,6 @@ def verify_trust_proof(fixture: dict[str, Any]) -> VerifyResult:
         )
     vs = _verifier_state(fixture)
     try:
-        _parse_rfc3339_strict(vs["clockRfc3339"])
         now = _parse_timestamp(vs["clockRfc3339"])
     except ValueError as exc:
         return VerifyResult(reject_category="VERIFIER_CONFIG_ERROR", reason=f"bad clockRfc3339: {exc}")
@@ -729,7 +813,7 @@ def verify_sth(fixture: dict[str, Any]) -> VerifyResult:
     if sth["treeSize"] <= 0:
         return VerifyResult(reject_category="STH_INVALID", reason=f"treeSize {sth['treeSize']} must be > 0")
     try:
-        datetime.fromisoformat(sth["timestamp"].replace("Z", "+00:00"))
+        _parse_rfc3339_strict(sth["timestamp"])
     except ValueError as exc:
         return VerifyResult(reject_category="STH_INVALID", reason=f"bad timestamp: {exc}")
     try:
@@ -767,7 +851,7 @@ def _wire_hash_bytes(wire: str) -> bytes:
     """Decodes a "SHA256:<64 lowercase hex>" wire hash."""
     if not wire.startswith("SHA256:"):
         raise ValueError(f"hash {wire!r} missing SHA256: prefix")
-    raw = bytes.fromhex(wire[len("SHA256:"):])
+    raw = _hex_bytes(wire[len("SHA256:"):])
     if len(raw) != 32:
         raise ValueError(f"hash {wire!r} must decode to 32 bytes, got {len(raw)}")
     return raw
@@ -836,7 +920,7 @@ def _check_embedded_sth(label: str, sth: dict[str, Any] | None, keys: list[dict[
     if sth["treeSize"] <= 0:
         return ("STH_INVALID", f"{label}.treeSize {sth['treeSize']} must be > 0")
     try:
-        datetime.fromisoformat(sth["timestamp"].replace("Z", "+00:00"))
+        _parse_rfc3339_strict(sth["timestamp"])
     except ValueError as exc:
         return ("STH_INVALID", f"{label} bad timestamp: {exc}")
     try:
@@ -1023,10 +1107,10 @@ def parse_fixture(text: str) -> dict[str, Any]:
     document must be a JSON object, may not use the NaN / Infinity
     extensions, and may not hold a JSON object outside the payload members
     that repeats a member name (a repeat inside one is a PARSE_ERROR verdict
-    from _decode_payload), nor a verifierState member of the wrong JSON
-    type. A document this refuses is a load error, not a verdict. An integer
-    literal too long for int() is kept as an _IntLiteral rather than
-    refused."""
+    from _decode_payload), nor a name, description, fixtureType,
+    keypairRefs, expected or verifierState member of the wrong JSON type. A
+    document this refuses is a load error, not a verdict. An integer literal
+    too long for int() is kept as an _IntLiteral rather than refused."""
     fixture = json.loads(
         text,
         object_pairs_hook=_JSONObject.from_pairs,
@@ -1038,6 +1122,7 @@ def parse_fixture(text: str) -> dict[str, Any]:
     repeated = _repeated_member("", fixture, _PAYLOAD_MEMBERS)
     if repeated:
         raise ValueError(f"{repeated}: duplicate member name")
+    _check_fixture_members(fixture)
     try:
         _verifier_state(fixture)
     except VerifierStateError as exc:

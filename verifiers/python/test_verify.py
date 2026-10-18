@@ -4,8 +4,10 @@ PARSE_ERROR verdict for members of the wrong JSON type and the reading of
 each member by its exact name, under the wire-shape rules both reference
 verifiers apply, the verdicts for trust-proof timestamps at the edges of the
 years 1 to 9999, the PARSE_ERROR verdict for a value that makes Python
-raise OverflowError and for an integer literal too long for int(), and the
-VERIFIER_CONFIG_ERROR verdict or load error for a bad verifierState.
+raise OverflowError and for an integer literal too long for int(), the
+VERIFIER_CONFIG_ERROR verdict or load error for a bad verifierState, the
+RFC 3339 date-time grammar of every timestamp, hex values read with no
+whitespace, and the load error for a fixture member of the wrong JSON type.
 
 Run from this directory:
     python3 -m unittest -v test_verify
@@ -17,6 +19,7 @@ import contextlib
 import copy
 import io
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -793,6 +796,260 @@ class UnexpectedExceptionTest(unittest.TestCase):
         self.assertEqual([ln.split()[0] for ln in results], ["FAIL", "PASS"])
         self.assertIn("(verifier error: KeyError: 'boom')", results[0])
         self.assertEqual(lines[-1], "summary: 1 pass, 1 fail (2 fixtures)")
+
+
+def member_value(fixture: dict[str, Any], path: str) -> Any:
+    """The member of fixture at the dotted path (array steps as indexes)."""
+    cur: Any = fixture
+    for step in path.split("."):
+        cur = cur[int(step)] if step.isdigit() else cur[step]
+    return cur
+
+
+# Timestamp members of committed ACCEPT fixtures, each with the REJECT
+# category both verifiers return when it holds a string that is not an
+# RFC 3339 date-time (the category of the step that reads it), and the
+# verdict ACCEPT where no step signs the member or compares it with another
+# time, so any RFC 3339 date-time leaves the fixture valid ("" where the
+# verdict depends on the time). ../go/verify_test.go holds the same table.
+TIMESTAMP_GRAMMAR_MEMBERS: list[tuple[str, str, str, str]] = [
+    ("trust-proof-baseline.json", "verifierState.clockRfc3339", "VERIFIER_CONFIG_ERROR", ""),
+    ("trust-proof-baseline.json", "trustProof.issuedAt", "PARSE_ERROR", ""),
+    ("trust-proof-baseline.json", "trustProof.expiresAt", "PARSE_ERROR", ""),
+    ("revocation-list-valid.json", "revocationList.nextSince", "PARSE_ERROR", "ACCEPT"),
+    ("revocation-list-valid.json", "revocationList.revocations.0.revokedAt", "PARSE_ERROR", "ACCEPT"),
+    ("transparency-log-sth.json", "signedTreeHead.timestamp", "STH_INVALID", "ACCEPT"),
+    ("transparency-inclusion-proof-valid.json", "inclusionProof.signedTreeHead.timestamp", "STH_INVALID", "ACCEPT"),
+    ("transparency-consistency-proof-valid.json", "consistencyProof.toSignedTreeHead.timestamp", "STH_INVALID", "ACCEPT"),
+]
+
+# Strings that are not RFC 3339 date-times, refused in every member of
+# TIMESTAMP_GRAMMAR_MEMBERS, with the parser that reads the string on its
+# own: fromisoformat (after "Z" is replaced by "+00:00"), Go's time.Parse
+# with the time.RFC3339 layout, both or neither. ../go/verify_test.go holds
+# the same list.
+NOT_RFC3339: list[str] = [
+    "2026-05-24 00:00:00Z",  # fromisoformat
+    "2026-05-24t00:00:00Z",  # fromisoformat
+    "2026-05-24T00:00:00",  # fromisoformat, with no zone
+    "2026-05-24T00:00:00+0000",  # fromisoformat
+    "20260524T000000Z",  # fromisoformat
+    "2026-05-24T00:00Z",  # fromisoformat
+    "2026-05-24T00Z",  # fromisoformat
+    "2026-W21-7T00:00:00Z",  # fromisoformat
+    "2026-05-24T00:00:00+01",  # fromisoformat
+    "2026-05-24T00:00:00+00",  # fromisoformat
+    "2026-05-24T00:00:00+00:00:00",  # fromisoformat
+    "2026-05-24T00:00:00.Z",  # fromisoformat
+    "2026-05-24T00:00:00 Z",  # fromisoformat
+    "2026-05-24T24:00:00Z",  # fromisoformat from Python 3.14, as the next midnight
+    "2026-05-24T0:00:00Z",  # time.Parse
+    "2026-05-24T00:00:00+24:00",  # time.Parse
+    "2026-05-24T00:00:00-24:00",  # time.Parse
+    "0000-01-01T00:00:00Z",  # time.Parse
+    "2026-05-24T00:00:00,5Z",  # both
+    "2026-05-24T00:00:00+00:60",  # both
+    "2026-05-24T00:00:00z",  # neither
+    "2026-05-24T23:59:60Z",  # neither
+    "2026-02-29T00:00:00Z",  # neither
+    "2026-05-24T00:00:00Z\n",  # neither
+    "\N{FULLWIDTH DIGIT TWO}026-05-24T00:00:00Z",  # neither
+    "",  # neither
+]
+
+# RFC 3339 date-times both verifiers read. ../go/verify_test.go holds the
+# same list.
+RFC3339_DATE_TIMES: list[str] = [
+    "2026-05-24T00:00:00Z",
+    "2026-05-24T00:00:00.5Z",
+    "2026-05-24T00:00:00.123456789012Z",
+    "2026-05-23T20:00:00-04:00",
+    "2026-05-24T05:30:00+05:30",
+    "2026-05-24T00:00:00-00:00",
+    "2026-05-24T00:00:00+23:59",
+    "2024-02-29T00:00:00Z",
+    "0001-01-01T00:00:00Z",
+    "9999-12-31T23:59:59Z",
+]
+
+# Trust-proof timestamps of trust-proof-baseline.json written another way for
+# the same time, which leaves the signed form and the verdict ACCEPT.
+# ../go/verify_test.go holds the same table.
+SAME_TIME_TIMESTAMPS: list[tuple[str, str]] = [
+    ("trustProof.issuedAt", "2026-05-23T08:00:00-04:00"),
+    ("trustProof.expiresAt", "2026-05-24T08:00:00+02:00"),
+    ("trustProof.expiresAt", "2026-05-24T06:00:00.000Z"),
+    ("verifierState.clockRfc3339", "2026-05-23T20:00:00-04:00"),
+]
+
+
+class TimestampGrammarTest(unittest.TestCase):
+    """Each timestamp, the verifier's clockRfc3339 included, is read only as
+    an RFC 3339 date-time with an upper-case T and Z, the strings the Go
+    verifier's parseRFC3339 reads, and any other string is refused with the
+    category of the step that reads it, the verdict the Go verifier returns
+    for the same input. The unmodified fixtures verify ACCEPT
+    (SchemaTypeViolationTest checks each one)."""
+
+    def test_not_rfc3339_is_refused(self) -> None:
+        for name, path, want, _ in TIMESTAMP_GRAMMAR_MEMBERS:
+            for value in NOT_RFC3339:
+                with self.subTest(path=path, value=value):
+                    got = verify.verify_fixture(with_member(load(name), path, json.dumps(value)))
+                    self.assertEqual("ACCEPT" if got.accepted else got.reject_category, want, str(got))
+
+    def test_rfc3339_is_read(self) -> None:
+        for name, path, _, want in TIMESTAMP_GRAMMAR_MEMBERS:
+            if not want:
+                continue
+            for value in RFC3339_DATE_TIMES:
+                with self.subTest(path=path, value=value):
+                    got = verify.verify_fixture(with_member(load(name), path, json.dumps(value)))
+                    self.assertEqual("ACCEPT" if got.accepted else got.reject_category, want, str(got))
+
+    def test_same_time_written_another_way(self) -> None:
+        for path, value in SAME_TIME_TIMESTAMPS:
+            with self.subTest(path=path, value=value):
+                got = verify.verify_fixture(with_member(load("trust-proof-baseline.json"), path, json.dumps(value)))
+                self.assertTrue(got.accepted, str(got))
+
+
+# Hex members of committed ACCEPT fixtures, each with the REJECT category
+# both verifiers return when an ASCII whitespace character is written after
+# its tenth hex digit: a configured public key is then skipped, so no
+# configured key verifies the signature, and a wire hash or a published key
+# is refused. ../go/verify_test.go holds the same table.
+HEX_MEMBERS: list[tuple[str, str, str]] = [
+    ("transparency-log-sth.json", "verifierState.publicKeys.0.publicKeyHex", "SIGNATURE_INVALID"),
+    ("trust-proof-baseline.json", "verifierState.publicKeys.0.publicKeyHex", "SIGNATURE_INVALID"),
+    ("trust-proof-hybrid.json", "verifierState.publicKeys.0.publicKeyHex", "SIGNATURE_INVALID"),
+    ("transparency-inclusion-proof-valid.json", "verifierState.publicKeys.0.publicKeyHex", "SIGNATURE_INVALID"),
+    ("transparency-consistency-proof-valid.json", "verifierState.publicKeys.0.publicKeyHex", "SIGNATURE_INVALID"),
+    ("transparency-log-sth.json", "signedTreeHead.rootHash", "STH_INVALID"),
+    ("transparency-inclusion-proof-valid.json", "inclusionProof.leafHash", "PARSE_ERROR"),
+    ("transparency-inclusion-proof-valid.json", "inclusionProof.auditPath.0", "PARSE_ERROR"),
+    ("transparency-inclusion-proof-valid.json", "inclusionProof.signedTreeHead.rootHash", "STH_INVALID"),
+    ("transparency-consistency-proof-valid.json", "consistencyProof.consistencyPath.0", "PARSE_ERROR"),
+    ("transparency-consistency-proof-valid.json", "consistencyProof.fromSignedTreeHead.rootHash", "STH_INVALID"),
+    ("discovery-valid.json", "discoveryResponse.publicKeys.0.publicKeyHex", "DISCOVERY_INVALID"),
+    ("discovery-valid.json", "discoveryResponse.publicKeys.1.publicKeyHex", "DISCOVERY_INVALID"),
+]
+
+# The ASCII whitespace characters bytes.fromhex skips between two bytes.
+# ../go/verify_test.go holds the same list.
+ASCII_WHITESPACE = (" ", "\t", "\n", "\v", "\f", "\r")
+
+
+def with_hex_space(value: str, space: str) -> str:
+    """value, a hex string with or without the SHA256: prefix, with space
+    written after its tenth hex digit, between its fifth and sixth bytes."""
+    at = len("SHA256:") + 10 if value.startswith("SHA256:") else 10
+    return value[:at] + space + value[at:]
+
+
+class HexDigitsTest(unittest.TestCase):
+    """A hex value is read only as an even number of hex digits in either
+    case, as the Go verifier's hex.DecodeString reads it, where
+    bytes.fromhex alone skips ASCII whitespace between bytes. The member in
+    upper case is read, and the fixture stays ACCEPT."""
+
+    def test_whitespace_in_hex_is_not_skipped(self) -> None:
+        for name, path, want in HEX_MEMBERS:
+            value = member_value(load(name), path)
+            for space in ASCII_WHITESPACE:
+                with self.subTest(fixture=name, path=path, space=space):
+                    got = verify.verify_fixture(with_member(load(name), path, json.dumps(with_hex_space(value, space))))
+                    self.assertEqual("ACCEPT" if got.accepted else got.reject_category, want, str(got))
+
+    def test_upper_case_hex_is_read(self) -> None:
+        for name, path, _ in HEX_MEMBERS:
+            with self.subTest(fixture=name, path=path):
+                value = member_value(load(name), path).upper()
+                got = verify.verify_fixture(with_member(load(name), path, json.dumps(value)))
+                self.assertTrue(got.accepted, str(got))
+
+
+def text_with_member(name: str, path: str, literal: str) -> str:
+    """The committed fixture name as JSON text, with the member at the
+    dotted path (array steps as indexes) replaced by the JSON literal as
+    written, which may be one json.loads cannot read back into a Python
+    value, such as an integer longer than int() converts."""
+    marker = json.dumps("\x00member\x00")
+    return json.dumps(with_member(load(name), path, marker)).replace(marker, literal, 1)
+
+
+# One member of trust-proof-baseline.json outside verifierState and the
+# payload members, left out (literal "") or replaced by the JSON literal,
+# with the outcome both verifiers return: ACCEPT, the REJECT category, or
+# "load error". ../go/verify_test.go holds the same table.
+FIXTURE_MEMBERS: list[tuple[str, str, str]] = [
+    ("name", "5", "load error"),
+    ("name", "[]", "load error"),
+    ("name", "9" * 5000, "load error"),
+    ("name", "null", "ACCEPT"),
+    ("name", "", "ACCEPT"),
+    ("description", "5", "load error"),
+    ("description", "{}", "load error"),
+    ("fixtureType", "5", "load error"),
+    ("fixtureType", '["trustProof"]', "load error"),
+    ("fixtureType", "null", "PARSE_ERROR"),
+    ("keypairRefs", '"issuer-primary"', "load error"),
+    ("keypairRefs", "{}", "load error"),
+    ("keypairRefs", "[5]", "load error"),
+    ("keypairRefs.0.publicKeyHex", "5", "load error"),
+    ("keypairRefs", "null", "ACCEPT"),
+    ("keypairRefs.0", "null", "ACCEPT"),
+    ("expected", "5", "load error"),
+    ("expected", "[]", "load error"),
+    ("expected", '"ACCEPT"', "load error"),
+    ("expected.verifyResult", "5", "load error"),
+    ("expected.verifyResult", "true", "load error"),
+    ("expected.rejectCategory", "5", "load error"),
+    ("expected.reasonContains", "[]", "load error"),
+    ("expected", "null", "ACCEPT"),
+    ("expected.verifyResult", "null", "ACCEPT"),
+]
+
+
+class FixtureMemberTest(unittest.TestCase):
+    """name, description, fixtureType, keypairRefs and expected are decoded
+    the way the Go verifier's encoding/json decodes them into its fixture
+    struct: a member of the wrong JSON type is a load error naming the
+    member, and an absent or null member is its zero value, which leaves
+    the verdict to the verification steps. The unmodified fixture verifies
+    ACCEPT (SchemaTypeViolationTest checks it)."""
+
+    def test_fixture_member(self) -> None:
+        for path, literal, want in FIXTURE_MEMBERS:
+            with self.subTest(path=path, value=literal[:24]):
+                if literal:
+                    text = text_with_member("trust-proof-baseline.json", path, literal)
+                else:
+                    text = json.dumps(renamed(load("trust-proof-baseline.json"), path, ""))
+                try:
+                    fixture = verify.parse_fixture(text)
+                except ValueError as exc:
+                    # The reason names the member or, for an array, the
+                    # element of the wrong type: keypairRefs[0] in [5].
+                    self.assertEqual(want, "load error", str(exc)[:200])
+                    self.assertRegex(str(exc)[:200], rf"^{re.escape(member_label(path))}(\[\d+\])?: JSON ")
+                    continue
+                got = verify.verify_fixture(fixture)
+                self.assertEqual("ACCEPT" if got.accepted else got.reject_category, want, str(got))
+
+    def test_directory_run_reports_load_error(self) -> None:
+        code, lines = run_main(
+            {
+                "a-name.json": text_with_member("trust-proof-baseline.json", "name", "5"),
+                "b-expected.json": text_with_member("trust-proof-baseline.json", "expected", "[]"),
+                "c-valid.json": (FIXTURES / "trust-proof-baseline.json").read_text(),
+            }
+        )
+        self.assertEqual(code, 1)
+        results = [ln for ln in lines if ln.startswith(("PASS", "FAIL"))]
+        self.assertEqual([ln.split()[0] for ln in results], ["FAIL", "FAIL", "PASS"])
+        self.assertIn("(load error: name: JSON number 5 does not fit the string", results[0])
+        self.assertIn("(load error: expected: JSON array does not fit the object", results[1])
 
 
 if __name__ == "__main__":

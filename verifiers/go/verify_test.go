@@ -648,6 +648,324 @@ func TestOutOfRangeUTCReason(t *testing.T) {
 	}
 }
 
+// outcome is the verdict of r as the tables below write it: ACCEPT or the
+// REJECT category.
+func outcome(r result) string {
+	if r.Accepted {
+		return "ACCEPT"
+	}
+	return r.RejectCategory
+}
+
+// jsonString is s written as a JSON string literal.
+func jsonString(t *testing.T, s string) string {
+	t.Helper()
+	b, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// memberValue returns the string member at the dotted path (array steps as
+// indexes) of the committed fixture name.
+func memberValue(t *testing.T, name, path string) string {
+	t.Helper()
+	doc, err := fs.ReadFile(os.DirFS(filepath.Join("..", "..", "fixtures")), name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cur any
+	if err := json.Unmarshal(doc, &cur); err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range strings.Split(path, ".") {
+		switch node := cur.(type) {
+		case map[string]any:
+			cur = node[step]
+		case []any:
+			i, err := strconv.Atoi(step)
+			if err != nil || i < 0 || i >= len(node) {
+				t.Fatalf("%s: %s has no element %s", name, path, step)
+			}
+			cur = node[i]
+		default:
+			t.Fatalf("%s: %s has no member %s", name, path, step)
+		}
+	}
+	s, ok := cur.(string)
+	if !ok {
+		t.Fatalf("%s: %s is not a string", name, path)
+	}
+	return s
+}
+
+// timestampGrammarMembers lists timestamp members of committed ACCEPT
+// fixtures, each with the REJECT category both verifiers return when it
+// holds a string that is not an RFC 3339 date-time (the category of the
+// step that reads it), and the verdict ACCEPT where no step signs the
+// member or compares it with another time, so any RFC 3339 date-time leaves
+// the fixture valid ("" where the verdict depends on the time).
+// ../python/test_verify.py holds the same table.
+var timestampGrammarMembers = []struct {
+	fixture, path, refused, read string
+}{
+	{"trust-proof-baseline.json", "verifierState.clockRfc3339", "VERIFIER_CONFIG_ERROR", ""},
+	{"trust-proof-baseline.json", "trustProof.issuedAt", "PARSE_ERROR", ""},
+	{"trust-proof-baseline.json", "trustProof.expiresAt", "PARSE_ERROR", ""},
+	{"revocation-list-valid.json", "revocationList.nextSince", "PARSE_ERROR", "ACCEPT"},
+	{"revocation-list-valid.json", "revocationList.revocations.0.revokedAt", "PARSE_ERROR", "ACCEPT"},
+	{"transparency-log-sth.json", "signedTreeHead.timestamp", "STH_INVALID", "ACCEPT"},
+	{"transparency-inclusion-proof-valid.json", "inclusionProof.signedTreeHead.timestamp", "STH_INVALID", "ACCEPT"},
+	{"transparency-consistency-proof-valid.json", "consistencyProof.toSignedTreeHead.timestamp", "STH_INVALID", "ACCEPT"},
+}
+
+// notRFC3339 lists strings that are not RFC 3339 date-times, refused in
+// every member of timestampGrammarMembers, with the parser that reads the
+// string on its own: Python's fromisoformat (after "Z" is replaced by
+// "+00:00"), time.Parse with the time.RFC3339 layout, both or neither.
+// ../python/test_verify.py holds the same list.
+var notRFC3339 = []string{
+	"2026-05-24 00:00:00Z",          // fromisoformat
+	"2026-05-24t00:00:00Z",          // fromisoformat
+	"2026-05-24T00:00:00",           // fromisoformat, with no zone
+	"2026-05-24T00:00:00+0000",      // fromisoformat
+	"20260524T000000Z",              // fromisoformat
+	"2026-05-24T00:00Z",             // fromisoformat
+	"2026-05-24T00Z",                // fromisoformat
+	"2026-W21-7T00:00:00Z",          // fromisoformat
+	"2026-05-24T00:00:00+01",        // fromisoformat
+	"2026-05-24T00:00:00+00",        // fromisoformat
+	"2026-05-24T00:00:00+00:00:00",  // fromisoformat
+	"2026-05-24T00:00:00.Z",         // fromisoformat
+	"2026-05-24T00:00:00 Z",         // fromisoformat
+	"2026-05-24T24:00:00Z",          // fromisoformat from Python 3.14, as the next midnight
+	"2026-05-24T0:00:00Z",           // time.Parse
+	"2026-05-24T00:00:00+24:00",     // time.Parse
+	"2026-05-24T00:00:00-24:00",     // time.Parse
+	"0000-01-01T00:00:00Z",          // time.Parse
+	"2026-05-24T00:00:00,5Z",        // both
+	"2026-05-24T00:00:00+00:60",     // both
+	"2026-05-24T00:00:00z",          // neither
+	"2026-05-24T23:59:60Z",          // neither
+	"2026-02-29T00:00:00Z",          // neither
+	"2026-05-24T00:00:00Z\n",        // neither
+	"\U0000ff12026-05-24T00:00:00Z", // neither: U+FF12 FULLWIDTH DIGIT TWO, then 026
+	"",                              // neither
+}
+
+// rfc3339DateTimes lists RFC 3339 date-times both verifiers read.
+// ../python/test_verify.py holds the same list.
+var rfc3339DateTimes = []string{
+	"2026-05-24T00:00:00Z",
+	"2026-05-24T00:00:00.5Z",
+	"2026-05-24T00:00:00.123456789012Z",
+	"2026-05-23T20:00:00-04:00",
+	"2026-05-24T05:30:00+05:30",
+	"2026-05-24T00:00:00-00:00",
+	"2026-05-24T00:00:00+23:59",
+	"2024-02-29T00:00:00Z",
+	"0001-01-01T00:00:00Z",
+	"9999-12-31T23:59:59Z",
+}
+
+// sameTimeTimestamps lists trust-proof timestamps of
+// trust-proof-baseline.json written another way for the same time, which
+// leaves the signed form and the verdict ACCEPT. ../python/test_verify.py
+// holds the same table.
+var sameTimeTimestamps = []struct{ path, value string }{
+	{"trustProof.issuedAt", "2026-05-23T08:00:00-04:00"},
+	{"trustProof.expiresAt", "2026-05-24T08:00:00+02:00"},
+	{"trustProof.expiresAt", "2026-05-24T06:00:00.000Z"},
+	{"verifierState.clockRfc3339", "2026-05-23T20:00:00-04:00"},
+}
+
+// TestNotRFC3339IsRefused: each timestamp, the verifier's clockRfc3339
+// included, is read only as an RFC 3339 date-time with an upper-case T and
+// Z, the strings the Python verifier's _parse_rfc3339_strict reads, and any
+// other string is refused with the category of the step that reads it, the
+// verdict the Python verifier returns for the same input. The unmodified
+// fixtures verify ACCEPT (TestSchemaTypeViolationIsParseError checks each
+// one).
+func TestNotRFC3339IsRefused(t *testing.T) {
+	for _, tc := range timestampGrammarMembers {
+		for _, value := range notRFC3339 {
+			t.Run(tc.path+"="+strconv.Quote(value), func(t *testing.T) {
+				got := verify(mutatedFixture(t, tc.fixture, tc.path, jsonString(t, value)))
+				if outcome(got) != tc.refused {
+					t.Fatalf("got %s, want %s", got, tc.refused)
+				}
+			})
+		}
+	}
+}
+
+// TestRFC3339IsRead: an RFC 3339 date-time in a member no step signs or
+// compares leaves the fixture ACCEPT.
+func TestRFC3339IsRead(t *testing.T) {
+	for _, tc := range timestampGrammarMembers {
+		if tc.read == "" {
+			continue
+		}
+		for _, value := range rfc3339DateTimes {
+			t.Run(tc.path+"="+value, func(t *testing.T) {
+				got := verify(mutatedFixture(t, tc.fixture, tc.path, jsonString(t, value)))
+				if outcome(got) != tc.read {
+					t.Fatalf("got %s, want %s", got, tc.read)
+				}
+			})
+		}
+	}
+}
+
+// TestSameTimeWrittenAnotherWay: a trust proof's timestamps and the
+// verifier's clock written with an offset or a fraction for the same time
+// verify ACCEPT.
+func TestSameTimeWrittenAnotherWay(t *testing.T) {
+	for _, tc := range sameTimeTimestamps {
+		t.Run(tc.path+"="+tc.value, func(t *testing.T) {
+			got := verify(mutatedFixture(t, "trust-proof-baseline.json", tc.path, jsonString(t, tc.value)))
+			if !got.Accepted {
+				t.Fatalf("got %s, want ACCEPT", got)
+			}
+		})
+	}
+}
+
+// hexMembers lists hex members of committed ACCEPT fixtures, each with the
+// REJECT category both verifiers return when an ASCII whitespace character
+// is written after its tenth hex digit: a configured public key is then
+// skipped, so no configured key verifies the signature, and a wire hash or
+// a published key is refused. ../python/test_verify.py holds the same
+// table.
+var hexMembers = []struct {
+	fixture, path, want string
+}{
+	{"transparency-log-sth.json", "verifierState.publicKeys.0.publicKeyHex", "SIGNATURE_INVALID"},
+	{"trust-proof-baseline.json", "verifierState.publicKeys.0.publicKeyHex", "SIGNATURE_INVALID"},
+	{"trust-proof-hybrid.json", "verifierState.publicKeys.0.publicKeyHex", "SIGNATURE_INVALID"},
+	{"transparency-inclusion-proof-valid.json", "verifierState.publicKeys.0.publicKeyHex", "SIGNATURE_INVALID"},
+	{"transparency-consistency-proof-valid.json", "verifierState.publicKeys.0.publicKeyHex", "SIGNATURE_INVALID"},
+	{"transparency-log-sth.json", "signedTreeHead.rootHash", "STH_INVALID"},
+	{"transparency-inclusion-proof-valid.json", "inclusionProof.leafHash", "PARSE_ERROR"},
+	{"transparency-inclusion-proof-valid.json", "inclusionProof.auditPath.0", "PARSE_ERROR"},
+	{"transparency-inclusion-proof-valid.json", "inclusionProof.signedTreeHead.rootHash", "STH_INVALID"},
+	{"transparency-consistency-proof-valid.json", "consistencyProof.consistencyPath.0", "PARSE_ERROR"},
+	{"transparency-consistency-proof-valid.json", "consistencyProof.fromSignedTreeHead.rootHash", "STH_INVALID"},
+	{"discovery-valid.json", "discoveryResponse.publicKeys.0.publicKeyHex", "DISCOVERY_INVALID"},
+	{"discovery-valid.json", "discoveryResponse.publicKeys.1.publicKeyHex", "DISCOVERY_INVALID"},
+}
+
+// asciiWhitespace lists the ASCII whitespace characters Python's
+// bytes.fromhex skips between two bytes. ../python/test_verify.py holds the
+// same list.
+var asciiWhitespace = []string{" ", "\t", "\n", "\v", "\f", "\r"}
+
+// withHexSpace returns value, a hex string with or without the "SHA256:"
+// prefix, with space written after its tenth hex digit, between its fifth
+// and sixth bytes.
+func withHexSpace(value, space string) string {
+	at := 10
+	if strings.HasPrefix(value, "SHA256:") {
+		at += len("SHA256:")
+	}
+	return value[:at] + space + value[at:]
+}
+
+// TestHexDigits: a hex value is read only as an even number of hex digits
+// in either case, as hex.DecodeString reads it, which is what the Python
+// verifier's _hex_bytes reads where bytes.fromhex alone skips ASCII
+// whitespace between bytes. The member in upper case is read, and the
+// fixture stays ACCEPT.
+func TestHexDigits(t *testing.T) {
+	for _, tc := range hexMembers {
+		value := memberValue(t, tc.fixture, tc.path)
+		for _, space := range asciiWhitespace {
+			t.Run(tc.fixture+":"+tc.path+"="+strconv.Quote(space), func(t *testing.T) {
+				got := verify(mutatedFixture(t, tc.fixture, tc.path, jsonString(t, withHexSpace(value, space))))
+				if outcome(got) != tc.want {
+					t.Fatalf("got %s, want %s", got, tc.want)
+				}
+			})
+		}
+		t.Run(tc.fixture+":"+tc.path+"=upper case", func(t *testing.T) {
+			got := verify(mutatedFixture(t, tc.fixture, tc.path, jsonString(t, strings.ToUpper(value))))
+			if !got.Accepted {
+				t.Fatalf("got %s, want ACCEPT", got)
+			}
+		})
+	}
+}
+
+// fixtureMembers leaves one member of trust-proof-baseline.json outside
+// verifierState and the payload members out (literal "") or replaces it
+// with the raw JSON literal, with the outcome both verifiers return: ACCEPT,
+// the REJECT category, or "load error". ../python/test_verify.py holds the
+// same table.
+var fixtureMembers = []struct {
+	path, literal, want string
+}{
+	{"name", "5", "load error"},
+	{"name", "[]", "load error"},
+	{"name", strings.Repeat("9", 5000), "load error"},
+	{"name", "null", "ACCEPT"},
+	{"name", "", "ACCEPT"},
+	{"description", "5", "load error"},
+	{"description", "{}", "load error"},
+	{"fixtureType", "5", "load error"},
+	{"fixtureType", `["trustProof"]`, "load error"},
+	{"fixtureType", "null", "PARSE_ERROR"},
+	{"keypairRefs", `"issuer-primary"`, "load error"},
+	{"keypairRefs", "{}", "load error"},
+	{"keypairRefs", "[5]", "load error"},
+	{"keypairRefs.0.publicKeyHex", "5", "load error"},
+	{"keypairRefs", "null", "ACCEPT"},
+	{"keypairRefs.0", "null", "ACCEPT"},
+	{"expected", "5", "load error"},
+	{"expected", "[]", "load error"},
+	{"expected", `"ACCEPT"`, "load error"},
+	{"expected.verifyResult", "5", "load error"},
+	{"expected.verifyResult", "true", "load error"},
+	{"expected.rejectCategory", "5", "load error"},
+	{"expected.reasonContains", "[]", "load error"},
+	{"expected", "null", "ACCEPT"},
+	{"expected.verifyResult", "null", "ACCEPT"},
+}
+
+// TestFixtureMember: parseFixture decodes name, description, fixtureType,
+// keypairRefs and expected with encoding/json into the fixture struct, so a
+// member of the wrong JSON type is a load error, and an absent or null
+// member is its zero value, which leaves the verdict to the verification
+// steps: the outcome the Python verifier returns for the same input. The
+// unmodified fixture verifies ACCEPT (TestSchemaTypeViolationIsParseError
+// checks it).
+func TestFixtureMember(t *testing.T) {
+	for _, tc := range fixtureMembers {
+		t.Run(tc.path+"="+shortLiteral(tc.literal), func(t *testing.T) {
+			doc, err := os.ReadFile(filepath.Join("..", "..", "fixtures", "trust-proof-baseline.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := strings.Split(tc.path, ".")
+			if tc.literal == "" {
+				doc = renameMember(t, doc, path, "")
+			} else {
+				doc = setMember(t, doc, path, tc.literal)
+			}
+			f, err := parseFixture(doc)
+			if err != nil {
+				if tc.want != "load error" {
+					t.Fatalf("load error %v, want %s", err, tc.want)
+				}
+				return
+			}
+			if got := verify(f); outcome(got) != tc.want {
+				t.Fatalf("got %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
 // modulePath is where this module lives. `go run <modulePath>@latest`, the
 // README's first command, fails when go.mod declares any other path.
 const modulePath = "github.com/opena2a-standards/atp-conformance/verifiers/go"

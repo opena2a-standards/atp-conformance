@@ -46,6 +46,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -215,23 +216,58 @@ func normalizeRFC3339(s string) string {
 	return t.UTC().Format(time.RFC3339)
 }
 
+// rfc3339DateTime is the RFC 3339 §5.6 date-time with the "T" and "Z" in
+// upper case, as the time.RFC3339 layout writes them (RFC 3339 also allows
+// them in lower case, which time.Parse refuses): a 4-digit year, a 2-digit
+// month, day, hour, minute and second, an optional fraction of one or more
+// digits after ".", and "Z" or a numeric offset. The groups are the year,
+// the hour, and the offset hour and minute. The Python verifier's
+// _RFC3339_DATE_TIME is the same expression, which it matches against the
+// whole string.
+var rfc3339DateTime = regexp.MustCompile(`^([0-9]{4})-[0-9]{2}-[0-9]{2}T([0-9]{2}):[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:Z|[+-]([0-9]{2}):([0-9]{2}))$`)
+
+// parseRFC3339 reads s as an RFC 3339 date-time, with the checks of the
+// Python verifier's _parse_rfc3339_strict in the same order, so both
+// verifiers read the same strings. When its RFC 3339 fast path fails,
+// time.Parse with the time.RFC3339 layout falls back to a looser reading
+// that takes a one-digit hour, a "," before the fraction, and an offset
+// hour of 24 or offset minute of 60, none of which the RFC 3339 grammar
+// allows. The expression refuses the first two. The checks after it refuse
+// the year 0000, which time.Parse reads and Python's datetime does not
+// hold, an hour above 23 (from Python 3.14, fromisoformat reads 24:00:00 as
+// the next midnight), and an offset hour above 23 or minute above 59.
+// time.Parse then checks the month, day, minute and second.
+func parseRFC3339(s string) (time.Time, error) {
+	m := rfc3339DateTime.FindStringSubmatch(s)
+	if m == nil {
+		return time.Time{}, fmt.Errorf("%q is not in the RFC 3339 form YYYY-MM-DDThh:mm:ss[.digits](Z|+hh:mm|-hh:mm)", s)
+	}
+	year, hour, offsetHour, offsetMinute := m[1], m[2], m[3], m[4]
+	if year == "0000" {
+		return time.Time{}, fmt.Errorf("%s falls outside the years 1 to 9999 as written", s)
+	}
+	if hour > "23" {
+		return time.Time{}, fmt.Errorf("%q has an hour above 23", s)
+	}
+	if offsetHour > "23" || offsetMinute > "59" {
+		return time.Time{}, fmt.Errorf("%q has a zone offset hour above 23 or minute above 59", s)
+	}
+	return time.Parse(time.RFC3339, s)
+}
+
 // parseTimestamp reads a trust proof's issuedAt or expiresAt, or the
-// verifier's clockRfc3339, with the time.RFC3339 layout, and refuses a time
-// whose date as written or whose UTC equivalent falls outside the years 1 to
-// 9999. time.Parse alone reads a date written in year 0000, and an offset
-// can move the UTC equivalent out of those years:
-// 0001-01-01T00:00:00+01:00 is 0000-12-31T23:00:00Z and
+// verifier's clockRfc3339, with parseRFC3339, and refuses a time whose UTC
+// equivalent falls outside the years 1 to 9999, as parseRFC3339 refuses a
+// date written in year 0000. An offset can move the UTC equivalent out of
+// those years: 0001-01-01T00:00:00+01:00 is 0000-12-31T23:00:00Z and
 // 9999-12-31T23:59:59-01:00 is 10000-01-01T00:59:59Z, which has no RFC 3339
 // form. Python's datetime holds only the years 1 to 9999, so the Python
 // verifier cannot read such a time, and both verifiers refuse it rather than
 // one of them verifying it.
 func parseTimestamp(s string) (time.Time, error) {
-	t, err := time.Parse(time.RFC3339, s)
+	t, err := parseRFC3339(s)
 	if err != nil {
 		return time.Time{}, err
-	}
-	if t.Year() < 1 {
-		return time.Time{}, fmt.Errorf("%s falls outside the years 1 to 9999 as written", s)
 	}
 	if utc := t.UTC(); utc.Year() < 1 || utc.Year() > 9999 {
 		return time.Time{}, fmt.Errorf("%s falls outside the years 1 to 9999 in UTC", s)
@@ -828,7 +864,7 @@ func verifySTH(f fixture) result {
 	if sth.TreeSize <= 0 {
 		return result{RejectCategory: "STH_INVALID", Reason: fmt.Sprintf("treeSize %d must be > 0", sth.TreeSize)}
 	}
-	if _, err := time.Parse(time.RFC3339, sth.Timestamp); err != nil {
+	if _, err := parseRFC3339(sth.Timestamp); err != nil {
 		return result{RejectCategory: "STH_INVALID", Reason: "bad timestamp: " + err.Error()}
 	}
 	rootBytes, err := sthSignedBytes(sth.RootHash)
@@ -861,7 +897,7 @@ func checkEmbeddedSTH(label string, sth *signedTreeHead, keys []keypairRef) (str
 	if sth.TreeSize <= 0 {
 		return "STH_INVALID", fmt.Sprintf("%s.treeSize %d must be > 0", label, sth.TreeSize)
 	}
-	if _, err := time.Parse(time.RFC3339, sth.Timestamp); err != nil {
+	if _, err := parseRFC3339(sth.Timestamp); err != nil {
 		return "STH_INVALID", label + " bad timestamp: " + err.Error()
 	}
 	rootBytes, err := sthSignedBytes(sth.RootHash)
@@ -1088,14 +1124,14 @@ func verifyRevocationList(f fixture) result {
 	if rl.NextSince == "" {
 		return result{RejectCategory: "PARSE_ERROR", Reason: "nextSince missing"}
 	}
-	if _, err := time.Parse(time.RFC3339, rl.NextSince); err != nil {
+	if _, err := parseRFC3339(rl.NextSince); err != nil {
 		return result{RejectCategory: "PARSE_ERROR", Reason: "nextSince is not RFC 3339: " + err.Error()}
 	}
 	for i, entry := range rl.Revocations {
 		if entry.AgentDID == "" || !strings.HasPrefix(entry.AgentDID, "did:") {
 			return result{RejectCategory: "PARSE_ERROR", Reason: fmt.Sprintf("revocations[%d].agentDid %q is not a DID", i, entry.AgentDID)}
 		}
-		if _, err := time.Parse(time.RFC3339, entry.RevokedAt); err != nil {
+		if _, err := parseRFC3339(entry.RevokedAt); err != nil {
 			return result{RejectCategory: "PARSE_ERROR", Reason: fmt.Sprintf("revocations[%d].revokedAt is not RFC 3339: %v", i, err)}
 		}
 		if entry.Reason == "" {
