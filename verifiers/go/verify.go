@@ -32,6 +32,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"embed"
@@ -246,12 +247,18 @@ func (r result) String() string {
 // overflow, an array where a string is expected, a null where the struct
 // has no pointer) yields a non-empty PARSE_ERROR reason naming the member,
 // so the verdict matches the Python verifier instead of surfacing as a load
-// error. The struct types are the schema's: int / int64 for integer,
-// float64 for number, string for string.
+// error. So does a member name that a JSON object in the payload repeats:
+// repeatedMember walks the payload before it is decoded. The struct types
+// are the schema's: int / int64 for integer, float64 for number, string for
+// string. A member is read by its exact name (exactMembers).
 func decodePayload[T any](label string, raw json.RawMessage) (*T, string) {
 	if len(raw) == 0 {
 		return nil, ""
 	}
+	if member := repeatedMember(label, raw, nil); member != "" {
+		return nil, member + ": duplicate member name"
+	}
+	raw = exactMembers(raw, reflect.TypeOf((*T)(nil)).Elem())
 	var out *T
 	if err := json.Unmarshal(raw, &out); err != nil {
 		var typeErr *json.UnmarshalTypeError
@@ -301,12 +308,9 @@ func nullMember(label string, raw json.RawMessage, t reflect.Type) (string, refl
 		}
 		for i := 0; i < t.NumField(); i++ {
 			field := t.Field(i)
-			name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
-			if name == "" {
-				name = field.Name
-			}
+			name, decoded := memberName(field)
 			value, present := members[name]
-			if !present || !field.IsExported() || name == "-" {
+			if !present || !decoded {
 				continue
 			}
 			if member, mt := nullMember(label+"."+name, value, field.Type); member != "" {
@@ -340,6 +344,225 @@ func nullMember(label string, raw json.RawMessage, t reflect.Type) (string, refl
 		}
 	}
 	return "", nil
+}
+
+// memberName is the JSON member name encoding/json decodes into field, and
+// whether it decodes into field at all.
+func memberName(field reflect.StructField) (string, bool) {
+	name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+	if name == "" {
+		name = field.Name
+	}
+	return name, field.IsExported() && name != "-"
+}
+
+// rawMessageType is the type of a fixture's payload members, which stay raw
+// until decodePayload decodes them.
+var rawMessageType = reflect.TypeOf(json.RawMessage(nil))
+
+// exactMembers returns raw with each member of an object that decodes into
+// a struct left out unless its name is exactly the JSON name of one of the
+// struct's fields, walking raw along the decode target t (pointers, struct
+// fields, array elements, map values). encoding/json matches a member name
+// to a field case-insensitively, so on its own it decodes TreeSize,
+// treesize or "tree\U0000017fize" (U+017F folds to S) as treeSize. JSON
+// member names are case-sensitive and the Python verifier's _decode reads
+// each member by its exact name, so in both verifiers such a member is not
+// the schema member, which is then absent. A map key is data, not a member
+// name, and is kept. The members kept stay in document order, repeated
+// names included. A value that is not the JSON type t needs is returned
+// unchanged, for the decode to reject.
+func exactMembers(raw json.RawMessage, t reflect.Type) json.RawMessage {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t == rawMessageType {
+		return raw
+	}
+	switch t.Kind() {
+	case reflect.Struct:
+		members, ok := objectMembers(raw)
+		if !ok {
+			return raw
+		}
+		fields := map[string]reflect.Type{}
+		for i := 0; i < t.NumField(); i++ {
+			if name, decoded := memberName(t.Field(i)); decoded {
+				fields[name] = t.Field(i).Type
+			}
+		}
+		var kept []objectMember
+		for _, m := range members {
+			if ft, ok := fields[m.name]; ok {
+				kept = append(kept, objectMember{m.name, exactMembers(m.value, ft)})
+			}
+		}
+		return encodeObject(kept)
+	case reflect.Map:
+		members, ok := objectMembers(raw)
+		if !ok {
+			return raw
+		}
+		for i := range members {
+			members[i].value = exactMembers(members[i].value, t.Elem())
+		}
+		return encodeObject(members)
+	case reflect.Slice:
+		elems, ok := arrayElements(raw)
+		if !ok {
+			return raw
+		}
+		out := []byte{'['}
+		for i, elem := range elems {
+			if i > 0 {
+				out = append(out, ',')
+			}
+			out = append(out, exactMembers(elem, t.Elem())...)
+		}
+		return append(out, ']')
+	}
+	return raw
+}
+
+// objectMember is one member of a JSON object: its name and its raw value.
+type objectMember struct {
+	name  string
+	value json.RawMessage
+}
+
+// objectMembers returns the members of raw in document order, repeated
+// names included, when raw is a JSON object.
+func objectMembers(raw json.RawMessage) ([]objectMember, bool) {
+	if !json.Valid(raw) {
+		return nil, false
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return nil, false
+	}
+	var members []objectMember
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return nil, false
+		}
+		name, _ := tok.(string)
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return nil, false
+		}
+		members = append(members, objectMember{name, value})
+	}
+	return members, true
+}
+
+// encodeObject writes members as a JSON object, in order.
+func encodeObject(members []objectMember) json.RawMessage {
+	out := []byte{'{'}
+	for i, m := range members {
+		if i > 0 {
+			out = append(out, ',')
+		}
+		name, _ := json.Marshal(m.name)
+		out = append(out, name...)
+		out = append(out, ':')
+		out = append(out, m.value...)
+	}
+	return append(out, '}')
+}
+
+// arrayElements returns the elements of raw when it is a JSON array.
+func arrayElements(raw json.RawMessage) ([]json.RawMessage, bool) {
+	var elems []json.RawMessage
+	if trimmed := bytes.TrimSpace(raw); len(trimmed) == 0 || trimmed[0] != '[' || json.Unmarshal(raw, &elems) != nil {
+		return nil, false
+	}
+	return elems, true
+}
+
+// payloadMembers are the fixture members decodePayload decodes: the protocol
+// response under test. A repeated member name inside one is a PARSE_ERROR
+// verdict on the fixture; elsewhere in the fixture document it is a load
+// error (parseFixture). The Python verifier's _PAYLOAD_MEMBERS holds the same
+// names.
+var payloadMembers = map[string]bool{
+	"discoveryResponse": true,
+	"trustProof":        true,
+	"signedTreeHead":    true,
+	"inclusionProof":    true,
+	"consistencyProof":  true,
+	"revocationList":    true,
+}
+
+// repeatedMember returns the first member name, in document order, that a
+// JSON object in raw repeats, named the way nullMember names members
+// (object.member, array[index]; a top-level member with an empty label is
+// its bare name), or "" when no object repeats a name. RFC 8259 §4 leaves a
+// repeated name's meaning to the receiver, and the two verifiers' decoders
+// read it differently: encoding/json decodes the occurrences into the same
+// field one after another, so the members of an earlier object occurrence
+// survive and the first type error is the one reported, where Python's
+// json.loads keeps only the last occurrence. Both verifiers refuse such a
+// document instead, as RFC 7493 §2.3 requires of I-JSON, so neither
+// verifies its own reading of it. The value of a member whose path is in
+// skip is not walked. raw is valid JSON: it comes from a document
+// json.Unmarshal has accepted.
+func repeatedMember(label string, raw []byte, skip map[string]bool) string {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	// Without UseNumber, Token stops with an error at a number such as 1e400
+	// that does not fit a float64, and a repeat after it would go unseen.
+	dec.UseNumber()
+	member, _ := walkMembers(dec, label, skip)
+	return member
+}
+
+// walkMembers reads the next JSON value from dec for repeatedMember and
+// returns the first repeated member in it.
+func walkMembers(dec *json.Decoder, label string, skip map[string]bool) (string, error) {
+	tok, err := dec.Token()
+	if err != nil {
+		return "", err
+	}
+	switch tok {
+	case json.Delim('{'):
+		seen := map[string]bool{}
+		for dec.More() {
+			if tok, err = dec.Token(); err != nil {
+				return "", err
+			}
+			name, _ := tok.(string)
+			path := name
+			if label != "" {
+				path = label + "." + name
+			}
+			if seen[name] {
+				return path, nil
+			}
+			seen[name] = true
+			if skip[path] {
+				var value json.RawMessage
+				err = dec.Decode(&value)
+			} else {
+				var member string
+				if member, err = walkMembers(dec, path, skip); member != "" {
+					return member, nil
+				}
+			}
+			if err != nil {
+				return "", err
+			}
+		}
+	case json.Delim('['):
+		for i := 0; dec.More(); i++ {
+			if member, err := walkMembers(dec, fmt.Sprintf("%s[%d]", label, i), skip); member != "" || err != nil {
+				return member, err
+			}
+		}
+	default:
+		return "", nil
+	}
+	_, err = dec.Token() // the closing } or ]
+	return "", err
 }
 
 // schemaWord names a decode target type in the vendored schemas' words.
@@ -1036,10 +1259,20 @@ func loadBuiltinFixture(path string) (fixture, error) {
 	return parseFixture(b)
 }
 
+// parseFixture decodes a fixture document. Its members (fixtureType,
+// verifierState, expected and the payload members) are read by their exact
+// names, as decodePayload reads a payload's (exactMembers). A JSON object
+// outside the payload members that repeats a member name is a load error:
+// the verifier configuration or expected outcome it carries has no single
+// reading. A repeat inside a payload member is a PARSE_ERROR verdict from
+// decodePayload.
 func parseFixture(b []byte) (fixture, error) {
 	var f fixture
-	if err := json.Unmarshal(b, &f); err != nil {
+	if err := json.Unmarshal(exactMembers(b, reflect.TypeOf(f)), &f); err != nil {
 		return fixture{}, err
+	}
+	if member := repeatedMember("", b, payloadMembers); member != "" {
+		return fixture{}, fmt.Errorf("%s: duplicate member name", member)
 	}
 	return f, nil
 }

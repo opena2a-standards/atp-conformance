@@ -14,6 +14,9 @@ Spec coverage:
   - wire shape: each payload member must carry the JSON type the vendored
     schema gives it (decoded with the Go verifier's rules), else the
     verdict is REJECT[PARSE_ERROR] naming the member
+  - repeated member names: a JSON object that repeats a member name is
+    REJECT[PARSE_ERROR] naming the member inside a payload member, and a
+    load error elsewhere in the fixture document, as in the Go verifier
 
 Out of scope:
   - ML-DSA-65 verification. The post-quantum Python library landscape is
@@ -145,8 +148,11 @@ def index_public_keys(refs: list[dict[str, Any]]):
 # a listed member that is absent takes the Go zero value ("", 0, 0.0, [] or
 # {}), a nested object member that is absent or null decodes to None (a nil
 # pointer, which the verification steps report as missing), and unlisted
-# members are ignored, as encoding/json does. {"*": shape} is a JSON object
-# whose values each have that shape.
+# members are ignored, as encoding/json does. A member is listed only under
+# its exact name, so TreeSize is an unlisted member and treeSize stays
+# absent; the Go verifier's exactMembers leaves such a member out before
+# encoding/json, which matches names case-insensitively, decodes the
+# object. {"*": shape} is a JSON object whose values each have that shape.
 #
 # JSON null is a value of no schema type, so a null member, array element or
 # object value is REJECT[PARSE_ERROR] like any other wrong type rather than
@@ -318,12 +324,100 @@ def _decode(label: str, value: Any, shape: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# repeated member names
+#
+# RFC 8259 §4 leaves the meaning of a member name that one JSON object repeats
+# to the receiver, and the two verifiers' decoders read it differently:
+# json.loads keeps only the last occurrence, where the Go verifier's
+# encoding/json decodes the occurrences into the same field one after
+# another, so the members of an earlier object occurrence survive and the
+# first type error is the one reported. Both verifiers refuse such a document
+# instead, as RFC 7493 §2.3 requires of I-JSON, so neither verifies its own
+# reading of it: a repeat inside a payload member is REJECT[PARSE_ERROR]
+# naming the member, and a repeat elsewhere in the fixture document is a
+# load error.
+# ---------------------------------------------------------------------------
+
+# The fixture members _decode_payload decodes: the protocol response under
+# test. The Go verifier's payloadMembers holds the same names.
+_PAYLOAD_MEMBERS = frozenset(
+    {"discoveryResponse", "trustProof", "signedTreeHead", "inclusionProof", "consistencyProof", "revocationList"}
+)
+
+
+class _JSONObject(dict):
+    """A JSON object as parse_fixture reads it: the dict json.loads builds,
+    in which the last occurrence of a repeated member name wins, with pairs
+    holding every member in document order, repeats included."""
+
+    pairs: list[tuple[str, Any]]
+
+    @classmethod
+    def from_pairs(cls, pairs: list[tuple[str, Any]]) -> _JSONObject:
+        obj = cls(pairs)
+        obj.pairs = pairs
+        return obj
+
+
+def _repeated_member(label: str, value: Any, skip: frozenset[str] = frozenset()) -> str:
+    """The first member name, in document order, that a JSON object in value
+    repeats, named the way _decode names members (object.member,
+    array[index]; a top-level member with an empty label is its bare name),
+    or "" when no object repeats a name. The same walk as the Go verifier's
+    repeatedMember. A dict that json.loads built without parse_fixture's
+    hook has no pairs and holds no repeats. The value of a member whose path
+    is in skip is not walked."""
+    # An explicit stack rather than recursion, so a deeply nested document
+    # cannot raise RecursionError here. Each entry walks one array or object:
+    # its path, an iterator over its (index or name, value) pairs, and the
+    # member names seen so far (None for an array).
+    stack: list[tuple[str, Any, set[str] | None]] = []
+
+    def enter(path: str, item: Any) -> None:
+        if isinstance(item, list):
+            stack.append((path, iter(enumerate(item)), None))
+        elif isinstance(item, dict):
+            pairs = item.pairs if isinstance(item, _JSONObject) else item.items()
+            stack.append((path, iter(pairs), set()))
+
+    enter(label, value)
+    while stack:
+        path, members, seen = stack[-1]
+        step = next(members, None)
+        if step is None:
+            stack.pop()
+            continue
+        key, item = step
+        if seen is None:
+            item_path = f"{path}[{key}]"
+        else:
+            item_path = f"{path}.{key}" if path else key
+            if key in seen:
+                return item_path
+            seen.add(key)
+        if item_path not in skip:
+            enter(item_path, item)
+    return ""
+
+
+def _decode_payload(fixture: dict[str, Any], label: str, shape: dict[str, Any]) -> Any:
+    """_decode for the payload member label of fixture, after checking, as
+    the Go verifier's decodePayload does first, that no JSON object in it
+    repeats a member name. Raises ShapeError naming the member."""
+    value = fixture.get(label)
+    repeated = _repeated_member(label, value)
+    if repeated:
+        raise ShapeError(f"{repeated}: duplicate member name")
+    return _decode(label, value, shape)
+
+
+# ---------------------------------------------------------------------------
 # per-type verifiers
 # ---------------------------------------------------------------------------
 
 def verify_discovery(fixture: dict[str, Any]) -> VerifyResult:
     try:
-        d = _decode("discoveryResponse", fixture.get("discoveryResponse"), _DISCOVERY_SHAPE)
+        d = _decode_payload(fixture, "discoveryResponse", _DISCOVERY_SHAPE)
     except ShapeError as exc:
         return VerifyResult(reject_category="PARSE_ERROR", reason=str(exc))
     if d is None:
@@ -394,7 +488,7 @@ def verify_discovery(fixture: dict[str, Any]) -> VerifyResult:
 
 def verify_trust_proof(fixture: dict[str, Any]) -> VerifyResult:
     try:
-        tp = _decode("trustProof", fixture.get("trustProof"), _TRUST_PROOF_SHAPE)
+        tp = _decode_payload(fixture, "trustProof", _TRUST_PROOF_SHAPE)
     except ShapeError as exc:
         return VerifyResult(reject_category="PARSE_ERROR", reason=str(exc))
     if tp is None:
@@ -499,7 +593,7 @@ def verify_trust_proof(fixture: dict[str, Any]) -> VerifyResult:
 
 def verify_sth(fixture: dict[str, Any]) -> VerifyResult:
     try:
-        sth = _decode("signedTreeHead", fixture.get("signedTreeHead"), _STH_SHAPE)
+        sth = _decode_payload(fixture, "signedTreeHead", _STH_SHAPE)
     except ShapeError as exc:
         return VerifyResult(reject_category="PARSE_ERROR", reason=str(exc))
     if sth is None:
@@ -641,7 +735,7 @@ def verify_inclusion_proof(fixture: dict[str, Any]) -> VerifyResult:
     """ATP §5.4: embedded tree head per §5.6, then RFC 9162 §2.1.3.2
     recomputation from leafHash along auditPath must reproduce sth.rootHash."""
     try:
-        ip = _decode("inclusionProof", fixture.get("inclusionProof"), _INCLUSION_PROOF_SHAPE)
+        ip = _decode_payload(fixture, "inclusionProof", _INCLUSION_PROOF_SHAPE)
     except ShapeError as exc:
         return VerifyResult(reject_category="PARSE_ERROR", reason=str(exc))
     if ip is None:
@@ -674,7 +768,7 @@ def verify_consistency_proof(fixture: dict[str, Any]) -> VerifyResult:
     """ATP §5.5: both embedded tree heads per §5.6, then RFC 9162 §2.1.4.2
     must reproduce both roots."""
     try:
-        cp = _decode("consistencyProof", fixture.get("consistencyProof"), _CONSISTENCY_PROOF_SHAPE)
+        cp = _decode_payload(fixture, "consistencyProof", _CONSISTENCY_PROOF_SHAPE)
     except ShapeError as exc:
         return VerifyResult(reject_category="PARSE_ERROR", reason=str(exc))
     if cp is None:
@@ -714,7 +808,7 @@ def verify_revocation_list(fixture: dict[str, Any]) -> VerifyResult:
     malformed timestamp rejects the WHOLE response — skipping unparseable
     entries keeps a revoked agent trusted."""
     try:
-        rl = _decode("revocationList", fixture.get("revocationList"), _REVOCATION_LIST_SHAPE)
+        rl = _decode_payload(fixture, "revocationList", _REVOCATION_LIST_SHAPE)
     except ShapeError as exc:
         return VerifyResult(reject_category="PARSE_ERROR", reason=str(exc))
     if rl is None:
@@ -803,11 +897,17 @@ def _reject_non_finite(literal: str) -> Any:
 
 def parse_fixture(text: str) -> dict[str, Any]:
     """Parses a fixture document with the Go verifier's acceptance: the
-    document must be a JSON object and may not use the NaN / Infinity
-    extensions. A document this refuses is a load error, not a verdict."""
-    fixture = json.loads(text, parse_constant=_reject_non_finite)
+    document must be a JSON object, may not use the NaN / Infinity
+    extensions, and may not hold a JSON object outside the payload members
+    that repeats a member name (a repeat inside one is a PARSE_ERROR verdict
+    from _decode_payload). A document this refuses is a load error, not a
+    verdict."""
+    fixture = json.loads(text, object_pairs_hook=_JSONObject.from_pairs, parse_constant=_reject_non_finite)
     if not isinstance(fixture, dict):
         raise ValueError(f"top-level JSON value is {type(fixture).__name__}, not an object")
+    repeated = _repeated_member("", fixture, _PAYLOAD_MEMBERS)
+    if repeated:
+        raise ValueError(f"{repeated}: duplicate member name")
     return fixture
 
 
