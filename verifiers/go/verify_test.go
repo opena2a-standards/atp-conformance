@@ -832,6 +832,57 @@ func TestSameTimeWrittenAnotherWay(t *testing.T) {
 	}
 }
 
+// subMicrosecondTimestamps lists the issuedAt, expiresAt and verifier
+// clockRfc3339 of trust-proof-baseline.json ("" keeps the fixture's value)
+// written with a fraction of a second of more than six digits, or a
+// microsecond past the edge of a comparison, with the verdict both
+// verifiers return. The proof expires at 2026-05-24T06:00:00Z, 18 hours
+// after its issuedAt, and the clock is 2026-05-24T00:00:00Z.
+// ../python/test_verify.py holds the same table.
+var subMicrosecondTimestamps = []struct {
+	issuedAt, expiresAt, clock, want string
+}{
+	{"", "", "2026-05-24T06:00:00.0000001Z", "ACCEPT"}, // the clock reads as the expiry time
+	{"", "", "2026-05-24T06:00:00.0000009Z", "ACCEPT"}, // dropped, not rounded up
+	{"", "", "2026-05-24T06:00:00.000000999999Z", "ACCEPT"},
+	{"", "", "2026-05-24T07:00:00.0000001+01:00", "ACCEPT"},
+	{"", "", "2026-05-24T06:00:00.000001Z", "EXPIRED"}, // a microsecond after the expiry time
+	{"", "2026-05-24T06:00:00.0000001Z", "2026-05-24T06:00:00.0000002Z", "ACCEPT"},
+	{"", "2026-05-24T12:00:00.0000001Z", "", "SIGNATURE_INVALID"},                    // a 24-hour window; the signed form then holds 12:00:00
+	{"", "2026-05-24T12:00:00.000001Z", "", "SEMANTIC_INVALID"},                      // a window a microsecond over 24 hours
+	{"2026-05-24T06:00:00Z", "2026-05-24T06:00:00.0000001Z", "", "SEMANTIC_INVALID"}, // expiresAt reads as issuedAt
+	{"2026-05-24T06:00:00Z", "2026-05-24T06:00:00.000001Z", "", "SIGNATURE_INVALID"}, // issued a microsecond before expiry; the signed form then holds the new issuedAt
+}
+
+// TestSubMicrosecondFraction: both verifiers read a timestamp to the
+// microsecond, dropping any digit of its fraction after the sixth, so the
+// expiry check, the issuedAt-before-expiresAt check and the 24-hour window
+// compare the same times in each and return the same verdict.
+// time.Parse alone keeps nine digits, and Python's datetime holds six.
+func TestSubMicrosecondFraction(t *testing.T) {
+	for _, tc := range subMicrosecondTimestamps {
+		values := []string{tc.issuedAt, tc.expiresAt, tc.clock}
+		t.Run(strings.Join(values, ","), func(t *testing.T) {
+			doc, err := json.Marshal(committedFixture(t, "trust-proof-baseline.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i, value := range values {
+				if value != "" {
+					doc = setMember(t, doc, strings.Split(timestampMembers[i], "."), jsonString(t, value))
+				}
+			}
+			var f fixture
+			if err := json.Unmarshal(doc, &f); err != nil {
+				t.Fatal(err)
+			}
+			if got := verify(f); outcome(got) != tc.want {
+				t.Fatalf("got %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
 // hexMembers lists hex members of committed ACCEPT fixtures, each with the
 // REJECT category both verifiers return when an ASCII whitespace character
 // is written after its tenth hex digit: a configured public key is then

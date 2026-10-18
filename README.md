@@ -93,6 +93,9 @@ and `Z`
 and a hex value only as an even number of hex digits
 ([rule](docs/how-it-works.md#hex-values-both-verifiers-read-hex-digits-only)),
 and refuse a string outside those forms at the step that reads it.
+Both read a fraction of a second to the microsecond, dropping any digit
+after the sixth, so they compare the same times
+([rule](docs/how-it-works.md#fractions-of-a-second-both-verifiers-read-microseconds)).
 
 ## Scope
 
