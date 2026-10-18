@@ -306,6 +306,138 @@ func TestNullOptionalOrEmbeddedMember(t *testing.T) {
 	}
 }
 
+// renameMember returns doc with the object member at path (object keys and
+// array indexes, in order) renamed to rename with its value kept, or left
+// out when rename is "".
+func renameMember(t *testing.T, doc json.RawMessage, path []string, rename string) json.RawMessage {
+	t.Helper()
+	if idx, err := strconv.Atoi(path[0]); err == nil {
+		var arr []json.RawMessage
+		if err := json.Unmarshal(doc, &arr); err != nil {
+			t.Fatalf("decode array before index %d: %v", idx, err)
+		}
+		arr[idx] = renameMember(t, arr[idx], path[1:], rename)
+		out, err := json.Marshal(arr)
+		if err != nil {
+			t.Fatalf("encode array: %v", err)
+		}
+		return out
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(doc, &obj); err != nil {
+		t.Fatalf("decode object before member %q: %v", path[0], err)
+	}
+	if len(path) > 1 {
+		obj[path[0]] = renameMember(t, obj[path[0]], path[1:], rename)
+	} else {
+		value, ok := obj[path[0]]
+		if !ok {
+			t.Fatalf("no member %q to rename", path[0])
+		}
+		delete(obj, path[0])
+		if rename != "" {
+			obj[rename] = value
+		}
+	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		t.Fatalf("encode object: %v", err)
+	}
+	return out
+}
+
+// renamedFixture loads the committed fixture name from ../../fixtures the
+// way loadFixture does, with the member at the dotted path (array steps as
+// indexes) renamed to rename, or left out when rename is "".
+func renamedFixture(t *testing.T, name, path, rename string) fixture {
+	t.Helper()
+	doc, err := fs.ReadFile(os.DirFS(filepath.Join("..", "..", "fixtures")), name)
+	if err != nil {
+		t.Fatalf("read %s: %v", name, err)
+	}
+	f, err := parseFixture(renameMember(t, doc, strings.Split(path, "."), rename))
+	if err != nil {
+		t.Fatalf("load %s with %s renamed to %q: %v", name, path, rename, err)
+	}
+	return f
+}
+
+// caseVariantMembers lists one member of a committed ACCEPT fixture renamed
+// to a name that differs from the schema's only in letter case, with the
+// verdict both verifiers return: ACCEPT or the REJECT category. A key of the
+// free-form endpoints object is data, not a schema member name, and is kept
+// as written. ../python/test_verify.py holds the same table.
+var caseVariantMembers = []struct {
+	fixture string
+	path    string
+	rename  string
+	want    string
+}{
+	{"transparency-log-sth.json", "signedTreeHead.treeSize", "TreeSize", "STH_INVALID"},
+	{"transparency-log-sth.json", "signedTreeHead.treeSize", "treesize", "STH_INVALID"},
+	{"transparency-log-sth.json", "signedTreeHead.treeSize", "tree\U0000017fize", "STH_INVALID"},
+	{"transparency-log-sth.json", "signedTreeHead", "SignedTreeHead", "PARSE_ERROR"},
+	{"transparency-log-sth.json", "fixtureType", "FixtureType", "PARSE_ERROR"},
+	{"trust-proof-baseline.json", "trustProof.issuerDid", "issuerDID", "UNTRUSTED_ISSUER"},
+	{"trust-proof-baseline.json", "trustProof.signatures.0.value", "Value", "SIGNATURE_INVALID"},
+	{"transparency-inclusion-proof-valid.json", "inclusionProof.signedTreeHead.treeSize", "TreeSize", "STH_INVALID"},
+	{"transparency-consistency-proof-valid.json", "consistencyProof.toSize", "ToSize", "PARSE_ERROR"},
+	{"revocation-list-valid.json", "revocationList.revocations.0.revokedByKeyId", "revokedByKeyID", "PARSE_ERROR"},
+	{"discovery-valid.json", "discoveryResponse.authorityDid", "AuthorityDid", "DISCOVERY_INVALID"},
+	{"discovery-valid.json", "discoveryResponse.endpoints.trustProof", "TrustProof", "ACCEPT"},
+}
+
+// TestCaseVariantMemberIsAbsent: JSON member names are case-sensitive and
+// the Python verifier reads each member by its exact name, so a member
+// renamed to another letter case verifies the same as the fixture with that
+// member left out. encoding/json alone matches TreeSize, treesize and
+// "tree\U0000017fize" (U+017F folds to S) to treeSize and the fixture
+// verifies ACCEPT. The unmodified fixtures verify ACCEPT
+// (TestSchemaTypeViolationIsParseError checks each one).
+func TestCaseVariantMemberIsAbsent(t *testing.T) {
+	for _, tc := range caseVariantMembers {
+		t.Run(tc.path+"="+tc.rename, func(t *testing.T) {
+			got := verify(renamedFixture(t, tc.fixture, tc.path, tc.rename))
+			if absent := verify(renamedFixture(t, tc.fixture, tc.path, "")); got.String() != absent.String() {
+				t.Fatalf("renamed: %s, left out: %s", got, absent)
+			}
+			verdict := got.RejectCategory
+			if got.Accepted {
+				verdict = "ACCEPT"
+			}
+			if verdict != tc.want {
+				t.Fatalf("got %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestExactMembers: a member whose name is not exactly a field's JSON name
+// is left out, the members kept stay in document order with repeated names
+// included, a map key is kept as written, a payload member of the fixture
+// document stays raw for decodePayload, and a value that is not the JSON
+// type the target needs is returned unchanged.
+func TestExactMembers(t *testing.T) {
+	cases := []struct {
+		target any
+		raw    string
+		want   string
+	}{
+		{signedTreeHead{}, `{"timestamp":"t","TreeSize":2,"treeSize":1,"extra":0,"treeSize":3}`, `{"timestamp":"t","treeSize":1,"treeSize":3}`},
+		{discoveryResponse{}, `{"Endpoints":{},"endpoints":{"TrustProof":"/p"}}`, `{"endpoints":{"TrustProof":"/p"}}`},
+		{revocationList{}, `{"revocations":[{"Reason":"r","reason":"s"},7,null]}`, `{"revocations":[{"reason":"s"},7,null]}`},
+		{revocationList{}, `{"revocations":null}`, `{"revocations":null}`},
+		{fixture{}, `{"FixtureType":"sth","expected":{"VerifyResult":"ACCEPT","verifyResult":"REJECT"},"VerifierState":{},"signedTreeHead":{"TreeSize":1}}`, `{"expected":{"verifyResult":"REJECT"},"signedTreeHead":{"TreeSize":1}}`},
+		{signedTreeHead{}, `null`, `null`},
+		{signedTreeHead{}, `"x"`, `"x"`},
+	}
+	for _, tc := range cases {
+		if got := string(exactMembers(json.RawMessage(tc.raw), reflect.TypeOf(tc.target))); got != tc.want {
+			t.Errorf("exactMembers(%s) = %s, want %s", tc.raw, got, tc.want)
+		}
+	}
+}
+
 // modulePath is where this module lives. `go run <modulePath>@latest`, the
 // README's first command, fails when go.mod declares any other path.
 const modulePath = "github.com/opena2a-standards/atp-conformance/verifiers/go"

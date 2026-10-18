@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Regression tests for verify.py: the ATP §8.1 revocation-entry checks, the
-PARSE_ERROR verdict for members of the wrong JSON type, under the wire-shape
-rules both reference verifiers apply, and the PARSE_ERROR verdict for a value
-that makes Python raise OverflowError.
+PARSE_ERROR verdict for members of the wrong JSON type and the reading of
+each member by its exact name, under the wire-shape rules both reference
+verifiers apply, and the PARSE_ERROR verdict for a value that makes Python
+raise OverflowError.
 
 Run from this directory:
     python3 -m unittest -v test_verify
@@ -320,6 +321,58 @@ class NullMemberTest(unittest.TestCase):
                 got = verify.verify_fixture(with_member(load(name), path, "null"))
                 self.assertEqual(got.reject_category, "PARSE_ERROR", str(got))
                 self.assertIn(reason, got.reason)
+
+
+def renamed(fixture: dict[str, Any], path: str, rename: str) -> dict[str, Any]:
+    """A copy of fixture with the object member at the dotted path (array
+    steps as indexes) renamed to rename with its value kept, or left out
+    when rename is ""."""
+    doc = copy.deepcopy(fixture)
+    steps: list[Any] = [int(step) if step.isdigit() else step for step in path.split(".")]
+    cur: Any = doc
+    for step in steps[:-1]:
+        cur = cur[step]
+    value = cur.pop(steps[-1])
+    if rename:
+        cur[rename] = value
+    return doc
+
+
+# One member of a committed ACCEPT fixture renamed to a name that differs
+# from the schema's only in letter case, with the verdict both verifiers
+# return: ACCEPT or the REJECT category. A key of the free-form endpoints
+# object is data, not a schema member name, and is kept as written.
+# ../go/verify_test.go holds the same table.
+CASE_VARIANT_MEMBERS: list[tuple[str, str, str, str]] = [
+    ("transparency-log-sth.json", "signedTreeHead.treeSize", "TreeSize", "STH_INVALID"),
+    ("transparency-log-sth.json", "signedTreeHead.treeSize", "treesize", "STH_INVALID"),
+    ("transparency-log-sth.json", "signedTreeHead.treeSize", "tree\N{LATIN SMALL LETTER LONG S}ize", "STH_INVALID"),
+    ("transparency-log-sth.json", "signedTreeHead", "SignedTreeHead", "PARSE_ERROR"),
+    ("transparency-log-sth.json", "fixtureType", "FixtureType", "PARSE_ERROR"),
+    ("trust-proof-baseline.json", "trustProof.issuerDid", "issuerDID", "UNTRUSTED_ISSUER"),
+    ("trust-proof-baseline.json", "trustProof.signatures.0.value", "Value", "SIGNATURE_INVALID"),
+    ("transparency-inclusion-proof-valid.json", "inclusionProof.signedTreeHead.treeSize", "TreeSize", "STH_INVALID"),
+    ("transparency-consistency-proof-valid.json", "consistencyProof.toSize", "ToSize", "PARSE_ERROR"),
+    ("revocation-list-valid.json", "revocationList.revocations.0.revokedByKeyId", "revokedByKeyID", "PARSE_ERROR"),
+    ("discovery-valid.json", "discoveryResponse.authorityDid", "AuthorityDid", "DISCOVERY_INVALID"),
+    ("discovery-valid.json", "discoveryResponse.endpoints.trustProof", "TrustProof", "ACCEPT"),
+]
+
+
+class CaseVariantMemberTest(unittest.TestCase):
+    """JSON member names are case-sensitive and each member is read by its
+    exact name, so a member renamed to another letter case verifies the same
+    as the fixture with that member left out, the verdict the Go verifier
+    returns for the same input. The unmodified fixtures verify ACCEPT
+    (SchemaTypeViolationTest checks each one)."""
+
+    def test_case_variant_member_is_absent(self) -> None:
+        for name, path, rename, want in CASE_VARIANT_MEMBERS:
+            with self.subTest(fixture=name, path=path, rename=rename):
+                got = verify.verify_fixture(renamed(load(name), path, rename))
+                absent = verify.verify_fixture(renamed(load(name), path, ""))
+                self.assertEqual(str(got), str(absent))
+                self.assertEqual("ACCEPT" if got.accepted else got.reject_category, want, str(got))
 
 
 class FixtureDocumentTest(unittest.TestCase):

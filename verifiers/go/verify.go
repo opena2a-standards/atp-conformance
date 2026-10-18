@@ -32,6 +32,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"embed"
@@ -247,11 +248,13 @@ func (r result) String() string {
 // has no pointer) yields a non-empty PARSE_ERROR reason naming the member,
 // so the verdict matches the Python verifier instead of surfacing as a load
 // error. The struct types are the schema's: int / int64 for integer,
-// float64 for number, string for string.
+// float64 for number, string for string. A member is read by its exact
+// name (exactMembers).
 func decodePayload[T any](label string, raw json.RawMessage) (*T, string) {
 	if len(raw) == 0 {
 		return nil, ""
 	}
+	raw = exactMembers(raw, reflect.TypeOf((*T)(nil)).Elem())
 	var out *T
 	if err := json.Unmarshal(raw, &out); err != nil {
 		var typeErr *json.UnmarshalTypeError
@@ -301,12 +304,9 @@ func nullMember(label string, raw json.RawMessage, t reflect.Type) (string, refl
 		}
 		for i := 0; i < t.NumField(); i++ {
 			field := t.Field(i)
-			name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
-			if name == "" {
-				name = field.Name
-			}
+			name, decoded := memberName(field)
 			value, present := members[name]
-			if !present || !field.IsExported() || name == "-" {
+			if !present || !decoded {
 				continue
 			}
 			if member, mt := nullMember(label+"."+name, value, field.Type); member != "" {
@@ -340,6 +340,140 @@ func nullMember(label string, raw json.RawMessage, t reflect.Type) (string, refl
 		}
 	}
 	return "", nil
+}
+
+// memberName is the JSON member name encoding/json decodes into field, and
+// whether it decodes into field at all.
+func memberName(field reflect.StructField) (string, bool) {
+	name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+	if name == "" {
+		name = field.Name
+	}
+	return name, field.IsExported() && name != "-"
+}
+
+// rawMessageType is the type of a fixture's payload members, which stay raw
+// until decodePayload decodes them.
+var rawMessageType = reflect.TypeOf(json.RawMessage(nil))
+
+// exactMembers returns raw with each member of an object that decodes into
+// a struct left out unless its name is exactly the JSON name of one of the
+// struct's fields, walking raw along the decode target t (pointers, struct
+// fields, array elements, map values). encoding/json matches a member name
+// to a field case-insensitively, so on its own it decodes TreeSize,
+// treesize or "tree\U0000017fize" (U+017F folds to S) as treeSize. JSON
+// member names are case-sensitive and the Python verifier's _decode reads
+// each member by its exact name, so in both verifiers such a member is not
+// the schema member, which is then absent. A map key is data, not a member
+// name, and is kept. The members kept stay in document order, repeated
+// names included. A value that is not the JSON type t needs is returned
+// unchanged, for the decode to reject.
+func exactMembers(raw json.RawMessage, t reflect.Type) json.RawMessage {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t == rawMessageType {
+		return raw
+	}
+	switch t.Kind() {
+	case reflect.Struct:
+		members, ok := objectMembers(raw)
+		if !ok {
+			return raw
+		}
+		fields := map[string]reflect.Type{}
+		for i := 0; i < t.NumField(); i++ {
+			if name, decoded := memberName(t.Field(i)); decoded {
+				fields[name] = t.Field(i).Type
+			}
+		}
+		var kept []objectMember
+		for _, m := range members {
+			if ft, ok := fields[m.name]; ok {
+				kept = append(kept, objectMember{m.name, exactMembers(m.value, ft)})
+			}
+		}
+		return encodeObject(kept)
+	case reflect.Map:
+		members, ok := objectMembers(raw)
+		if !ok {
+			return raw
+		}
+		for i := range members {
+			members[i].value = exactMembers(members[i].value, t.Elem())
+		}
+		return encodeObject(members)
+	case reflect.Slice:
+		elems, ok := arrayElements(raw)
+		if !ok {
+			return raw
+		}
+		out := []byte{'['}
+		for i, elem := range elems {
+			if i > 0 {
+				out = append(out, ',')
+			}
+			out = append(out, exactMembers(elem, t.Elem())...)
+		}
+		return append(out, ']')
+	}
+	return raw
+}
+
+// objectMember is one member of a JSON object: its name and its raw value.
+type objectMember struct {
+	name  string
+	value json.RawMessage
+}
+
+// objectMembers returns the members of raw in document order, repeated
+// names included, when raw is a JSON object.
+func objectMembers(raw json.RawMessage) ([]objectMember, bool) {
+	if !json.Valid(raw) {
+		return nil, false
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return nil, false
+	}
+	var members []objectMember
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return nil, false
+		}
+		name, _ := tok.(string)
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return nil, false
+		}
+		members = append(members, objectMember{name, value})
+	}
+	return members, true
+}
+
+// encodeObject writes members as a JSON object, in order.
+func encodeObject(members []objectMember) json.RawMessage {
+	out := []byte{'{'}
+	for i, m := range members {
+		if i > 0 {
+			out = append(out, ',')
+		}
+		name, _ := json.Marshal(m.name)
+		out = append(out, name...)
+		out = append(out, ':')
+		out = append(out, m.value...)
+	}
+	return append(out, '}')
+}
+
+// arrayElements returns the elements of raw when it is a JSON array.
+func arrayElements(raw json.RawMessage) ([]json.RawMessage, bool) {
+	var elems []json.RawMessage
+	if trimmed := bytes.TrimSpace(raw); len(trimmed) == 0 || trimmed[0] != '[' || json.Unmarshal(raw, &elems) != nil {
+		return nil, false
+	}
+	return elems, true
 }
 
 // schemaWord names a decode target type in the vendored schemas' words.
@@ -1036,9 +1170,12 @@ func loadBuiltinFixture(path string) (fixture, error) {
 	return parseFixture(b)
 }
 
+// parseFixture decodes a fixture document. Its members (fixtureType,
+// verifierState, expected and the payload members) are read by their exact
+// names, as decodePayload reads a payload's (exactMembers).
 func parseFixture(b []byte) (fixture, error) {
 	var f fixture
-	if err := json.Unmarshal(b, &f); err != nil {
+	if err := json.Unmarshal(exactMembers(b, reflect.TypeOf(f)), &f); err != nil {
 		return fixture{}, err
 	}
 	return f, nil

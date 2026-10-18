@@ -145,8 +145,11 @@ def index_public_keys(refs: list[dict[str, Any]]):
 # a listed member that is absent takes the Go zero value ("", 0, 0.0, [] or
 # {}), a nested object member that is absent or null decodes to None (a nil
 # pointer, which the verification steps report as missing), and unlisted
-# members are ignored, as encoding/json does. {"*": shape} is a JSON object
-# whose values each have that shape.
+# members are ignored, as encoding/json does. A member is listed only under
+# its exact name, so TreeSize is an unlisted member and treeSize stays
+# absent; the Go verifier's exactMembers leaves such a member out before
+# encoding/json, which matches names case-insensitively, decodes the
+# object. {"*": shape} is a JSON object whose values each have that shape.
 #
 # JSON null is a value of no schema type, so a null member, array element or
 # object value is REJECT[PARSE_ERROR] like any other wrong type rather than

@@ -117,6 +117,13 @@ tables and `_decode` in [`verifiers/python/verify.py`](../verifiers/python/verif
   which is then not checked (a present index must be `>= 0`), and an
   embedded payload or tree head object, which the steps then report as
   missing, also `PARSE_ERROR`;
+- a member is read by its exact name, since JSON member names are
+  case-sensitive: in a tree head, `TreeSize` or `treesize` is not
+  `treeSize`, and both verifiers ignore it as they ignore any member they
+  do not read, so `treeSize` is absent. `encoding/json` alone matches a
+  member name to a field case-insensitively, so the Go verifier leaves
+  out each member whose name is not exactly a field's before it decodes,
+  in the fixture document and in each payload;
 - an absent member decodes to the zero value (`""`, `0`, an empty array)
   and the verification steps then judge it.
 
