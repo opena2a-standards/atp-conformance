@@ -132,12 +132,13 @@ DID method.
 ## Continuous verification
 
 [`.github/workflows/conformance.yml`](./.github/workflows/conformance.yml)
-enforces every claim in this README on each push and pull request:
+runs these checks on each push to `main` and each pull request:
 
 1. Both reference verifiers run against `fixtures/` and must report
    `14 pass, 0 fail`.
 2. The fixture generator re-runs and the committed fixture bytes plus
-   `MANIFEST.sha256` must reproduce exactly (byte-pin).
+   `MANIFEST.sha256` must reproduce exactly (byte-pin), and each file
+   `MANIFEST.sha256` lists must hash to the SHA-256 recorded for it.
 3. The cross-implementation parity gate
    ([`scripts/parity/parity.py`](./scripts/parity/parity.py)) asserts the Go
    and Python verifiers agree per fixture on gate status, verdict, and
@@ -152,6 +153,26 @@ enforces every claim in this README on each push and pull request:
    validate against the ATP-SPEC machine-readable schemas.
 7. Those schemas are vendored under `schemas/vendor/agent-trust-protocol/`
    and byte-drift-gated against a pinned agent-trust-protocol ref.
+8. Each trust-proof fixture must declare a validity window of at most the
+   24 hours ATP §10.2 allows, except the REJECT fixture that pins a longer
+   one
+   ([`scripts/check_validity_window.py`](./scripts/check_validity_window.py)).
+9. The fixture counts this README states and the Fixtures table in
+   [docs/fixtures.md](docs/fixtures.md) must match the fixture set, and the
+   commands below must give each verifier unit suite the workflow does not
+   run and no suite it runs
+   ([`scripts/check_readme_counts.py`](./scripts/check_readme_counts.py)).
+
+The workflow does not run the verifiers' unit suites. They test the rules
+under [Parity](#parity) for member types, repeated member names,
+timestamps and hex values on cases the fixtures do not carry: no fixture
+timestamp has a fraction of a second, for example. Run both after changing
+a verifier (the Python suite needs the dependency installed above):
+
+```bash
+(cd verifiers/go && go test ./...)
+(cd verifiers/python && python3 -m unittest test_verify)
+```
 
 ## Reproducing the fixtures
 
