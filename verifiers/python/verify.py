@@ -206,6 +206,22 @@ def _parse_timestamp(value: str) -> datetime:
         raise ValueError(f"{value} falls outside the years 1 to 9999 in UTC") from None
 
 
+def _rfc3339_utc(dt: datetime) -> str:
+    """dt, a time in UTC, written as the Go verifier writes one with the
+    time.RFC3339Nano layout: a four-digit year, the fraction of a second to
+    the microsecond without its trailing zeros, and no fraction when it is
+    zero, then Z. The EXPIRED reason writes the expiry time and the
+    verifier's clock this way, to the microsecond the expiry check compares,
+    so a clock a microsecond after the expiry time does not read as the
+    expiry time, and both verifiers give the same reason."""
+    fraction = f"{dt.microsecond:06d}".rstrip("0")
+    return (
+        f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d}T{dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}"
+        + (f".{fraction}" if fraction else "")
+        + "Z"
+    )
+
+
 def index_public_keys(refs: list[dict[str, Any]]):
     # A configured key that is not hex (as _hex_bytes reads it) or not 32
     # bytes is skipped, as the Go verifier's indexPublicKeys skips it: a
@@ -732,7 +748,7 @@ def verify_trust_proof(fixture: dict[str, Any]) -> VerifyResult:
     if now > expires:
         return VerifyResult(
             reject_category="EXPIRED",
-            reason=f"expired at {expires.strftime('%Y-%m-%dT%H:%M:%SZ')}, verifier clock is {now.strftime('%Y-%m-%dT%H:%M:%SZ')}",
+            reason=f"expired at {_rfc3339_utc(expires)}, verifier clock is {_rfc3339_utc(now)}",
         )
 
     # Step 2: issuer trust.

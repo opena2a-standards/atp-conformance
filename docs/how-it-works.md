@@ -252,9 +252,17 @@ window. With the baseline proof, which expires at `2026-05-24T06:00:00Z`,
   `2026-05-24T12:00:00.000001Z`, a window a microsecond over 24 hours, it
   is `SEMANTIC_INVALID`.
 
-The `subMicrosecondTimestamps` table in
+The `EXPIRED` reason writes the expiry time and the verifier's clock in
+UTC to the microsecond the check compares, without the trailing zeros of
+a fraction of a second and with no fraction when it is zero, so a clock a
+microsecond after the expiry time does not read as the expiry time. With
+`clockRfc3339` set to `2026-05-24T06:00:00.000001Z`, both verifiers
+return
+`REJECT[EXPIRED: expired at 2026-05-24T06:00:00Z, verifier clock is 2026-05-24T06:00:00.000001Z]`.
+
+The `subMicrosecondTimestamps` and `expiredReasons` tables in
 [`verifiers/go/verify_test.go`](../verifiers/go/verify_test.go) and the
-`SUB_MICROSECOND_TIMESTAMPS` table in
+`SUB_MICROSECOND_TIMESTAMPS` and `EXPIRED_REASONS` tables in
 [`verifiers/python/test_verify.py`](../verifiers/python/test_verify.py)
 hold the same cases for both verifiers.
 
