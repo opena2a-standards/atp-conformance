@@ -764,11 +764,13 @@ def verify_revocation_list(fixture: dict[str, Any]) -> VerifyResult:
 def verify_fixture(fixture: dict[str, Any]) -> VerifyResult:
     # A member of the wrong JSON type (null, a string where an integer is
     # required, a number where an object is required) surfaces as one of
-    # these exceptions inside the per-type verifiers. It is a PARSE_ERROR for
-    # this fixture, not a reason to abort the run.
+    # these exceptions inside the per-type verifiers, and so does a timestamp
+    # whose UTC equivalent falls outside the years 1 to 9999 that datetime
+    # holds (OverflowError from astimezone). It is a PARSE_ERROR for this
+    # fixture, not a reason to abort the run.
     try:
         return _verify_fixture(fixture)
-    except (TypeError, ValueError, AttributeError, KeyError, IndexError) as exc:
+    except (TypeError, ValueError, AttributeError, KeyError, IndexError, OverflowError) as exc:
         ft = fixture.get("fixtureType") if isinstance(fixture, dict) else None
         return VerifyResult(
             reject_category="PARSE_ERROR",
