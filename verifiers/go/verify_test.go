@@ -1,8 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"io/fs"
+	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -298,5 +303,85 @@ func TestNullOptionalOrEmbeddedMember(t *testing.T) {
 				t.Fatalf("got %s, want PARSE_ERROR with %q", got, tc.wantReason)
 			}
 		})
+	}
+}
+
+// modulePath is where this module lives. `go run <modulePath>@latest`, the
+// README's first command, fails when go.mod declares any other path.
+const modulePath = "github.com/opena2a-standards/atp-conformance/verifiers/go"
+
+// TestModulePathIsTheReadmeEntryPoint: go.mod declares modulePath and the
+// README's first command runs it at @latest.
+func TestModulePathIsTheReadmeEntryPoint(t *testing.T) {
+	mod, err := fs.ReadFile(os.DirFS("."), "go.mod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first, _, _ := strings.Cut(string(mod), "\n"); first != "module "+modulePath {
+		t.Errorf("go.mod declares %q, want %q", first, "module "+modulePath)
+	}
+
+	readme, err := fs.ReadFile(os.DirFS(filepath.Join("..", "..")), "README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := ""
+	lines := strings.Split(string(readme), "\n")
+	for i := 0; i+1 < len(lines); i++ {
+		if strings.HasPrefix(lines[i], "```") {
+			command = lines[i+1]
+			break
+		}
+	}
+	if want := "go run " + modulePath + "@latest"; command != want {
+		t.Errorf("README's first command is %q, want %q", command, want)
+	}
+}
+
+// TestBuiltinFixturesAreTheFixturesDirectory: the set a run with no
+// arguments verifies holds the same files as ../../fixtures, byte for byte.
+// scripts/parity/parity.py makes the same check in CI.
+func TestBuiltinFixturesAreTheFixturesDirectory(t *testing.T) {
+	repo := os.DirFS(filepath.Join("..", ".."))
+	want, err := fs.Glob(repo, "fixtures/*.json")
+	if err != nil || len(want) == 0 {
+		t.Fatalf("../../fixtures/*.json: %d files, err %v", len(want), err)
+	}
+	got, err := builtinFixturePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("built-in set %v, ../../fixtures holds %v", got, want)
+	}
+	for _, name := range want {
+		committed, err := fs.ReadFile(repo, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		builtin, err := builtinFixtures.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(builtin, committed) {
+			t.Errorf("built-in %s differs from ../../%s", name, name)
+		}
+	}
+}
+
+// TestBuiltinFixturesPass verifies the built-in set the way a run with no
+// arguments does and expects every fixture to pass.
+func TestBuiltinFixturesPass(t *testing.T) {
+	paths, err := builtinFixturePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out strings.Builder
+	pass, fail := verifyAll(&out, paths, loadBuiltinFixture, func(p string) string { return p })
+	if pass == 0 || fail != 0 || pass != len(paths) {
+		t.Fatalf("%d pass, %d fail over %d built-in fixtures\n%s", pass, fail, len(paths), out.String())
+	}
+	if want := fmt.Sprintf("summary: %d pass, 0 fail (%d fixtures)\n", pass, pass); !strings.HasSuffix(out.String(), want) {
+		t.Errorf("output does not end with %q", want)
 	}
 }
