@@ -7,8 +7,9 @@ years 1 to 9999, the PARSE_ERROR verdict for a value that makes Python
 raise OverflowError and for an integer literal too long for int(), the
 VERIFIER_CONFIG_ERROR verdict or load error for a bad verifierState, the
 RFC 3339 date-time grammar of every timestamp, a fraction of a second read
-to the microsecond, hex values read with no whitespace, and the load error
-for a fixture member of the wrong JSON type.
+to the microsecond, the times an EXPIRED reason writes, hex values read
+with no whitespace, and the load error for a fixture member of the wrong
+JSON type.
 
 Run from this directory:
     python3 -m unittest -v test_verify
@@ -937,6 +938,17 @@ SUB_MICROSECOND_TIMESTAMPS: list[tuple[str, str, str, str]] = [
 ]
 
 
+def baseline_with_timestamps(*values: str) -> dict[str, Any]:
+    """trust-proof-baseline.json with its issuedAt, expiresAt and verifier
+    clockRfc3339 set to values, in that order ("" keeps the fixture's
+    value)."""
+    fixture = load("trust-proof-baseline.json")
+    for path, value in zip(TIMESTAMP_MEMBERS, values):
+        if value:
+            fixture = with_member(fixture, path, json.dumps(value))
+    return fixture
+
+
 class SubMicrosecondFractionTest(unittest.TestCase):
     """Both verifiers read a timestamp to the microsecond, dropping any digit
     of its fraction after the sixth, so the expiry check, the
@@ -947,12 +959,41 @@ class SubMicrosecondFractionTest(unittest.TestCase):
     def test_sub_microsecond_fraction(self) -> None:
         for *values, want in SUB_MICROSECOND_TIMESTAMPS:
             with self.subTest(values=values):
-                fixture = load("trust-proof-baseline.json")
-                for path, value in zip(TIMESTAMP_MEMBERS, values):
-                    if value:
-                        fixture = with_member(fixture, path, json.dumps(value))
-                got = verify.verify_fixture(fixture)
+                got = verify.verify_fixture(baseline_with_timestamps(*values))
                 self.assertEqual("ACCEPT" if got.accepted else got.reject_category, want, str(got))
+
+
+# The expiresAt and verifier clockRfc3339 of trust-proof-baseline.json (""
+# keeps the fixture's value) for which both verifiers return EXPIRED, with
+# the reason both give: each time in UTC, to the microsecond the expiry
+# check compares, with no trailing zeros in the fraction of a second and no
+# fraction when it is zero. The proof expires at 2026-05-24T06:00:00Z and the
+# clock is 2026-05-24T00:00:00Z. ../go/verify_test.go holds the same table.
+EXPIRED_REASONS: list[tuple[str, str, str]] = [
+    # (expiresAt, clockRfc3339, reason)
+    ("", "2026-05-24T06:00:01Z", "expired at 2026-05-24T06:00:00Z, verifier clock is 2026-05-24T06:00:01Z"),
+    # a microsecond after the expiry time
+    ("", "2026-05-24T06:00:00.000001Z", "expired at 2026-05-24T06:00:00Z, verifier clock is 2026-05-24T06:00:00.000001Z"),
+    # the seventh digit dropped
+    ("", "2026-05-24T06:00:00.0000019Z", "expired at 2026-05-24T06:00:00Z, verifier clock is 2026-05-24T06:00:00.000001Z"),
+    ("", "2026-05-24T06:00:00.500000Z", "expired at 2026-05-24T06:00:00Z, verifier clock is 2026-05-24T06:00:00.5Z"),
+    ("", "2026-05-24T08:00:00.00001+02:00", "expired at 2026-05-24T06:00:00Z, verifier clock is 2026-05-24T06:00:00.00001Z"),
+    ("2026-05-23T23:59:59.999999Z", "", "expired at 2026-05-23T23:59:59.999999Z, verifier clock is 2026-05-24T00:00:00Z"),
+    ("0001-01-01T00:00:00Z", "", "expired at 0001-01-01T00:00:00Z, verifier clock is 2026-05-24T00:00:00Z"),
+]
+
+
+class ExpiredReasonTest(unittest.TestCase):
+    """The EXPIRED reason writes the expiry time and the verifier's clock to
+    the microsecond the expiry check compares, so a clock a microsecond
+    after the expiry time does not read as the expiry time, and both
+    verifiers give the same reason."""
+
+    def test_expired_reason(self) -> None:
+        for expires_at, clock, want in EXPIRED_REASONS:
+            with self.subTest(expiresAt=expires_at, clock=clock):
+                got = verify.verify_fixture(baseline_with_timestamps("", expires_at, clock))
+                self.assertEqual(str(got), f"REJECT[EXPIRED: {want}]")
 
 
 # Hex members of committed ACCEPT fixtures, each with the REJECT category

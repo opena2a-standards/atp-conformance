@@ -854,6 +854,27 @@ var subMicrosecondTimestamps = []struct {
 	{"2026-05-24T06:00:00Z", "2026-05-24T06:00:00.000001Z", "", "SIGNATURE_INVALID"}, // issued a microsecond before expiry; the signed form then holds the new issuedAt
 }
 
+// baselineWithTimestamps returns trust-proof-baseline.json with its
+// issuedAt, expiresAt and verifier clockRfc3339 set to values, in that
+// order ("" keeps the fixture's value).
+func baselineWithTimestamps(t *testing.T, values []string) fixture {
+	t.Helper()
+	doc, err := json.Marshal(committedFixture(t, "trust-proof-baseline.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, value := range values {
+		if value != "" {
+			doc = setMember(t, doc, strings.Split(timestampMembers[i], "."), jsonString(t, value))
+		}
+	}
+	var f fixture
+	if err := json.Unmarshal(doc, &f); err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
 // TestSubMicrosecondFraction: both verifiers read a timestamp to the
 // microsecond, dropping any digit of its fraction after the sixth, so the
 // expiry check, the issuedAt-before-expiresAt check and the 24-hour window
@@ -863,21 +884,42 @@ func TestSubMicrosecondFraction(t *testing.T) {
 	for _, tc := range subMicrosecondTimestamps {
 		values := []string{tc.issuedAt, tc.expiresAt, tc.clock}
 		t.Run(strings.Join(values, ","), func(t *testing.T) {
-			doc, err := json.Marshal(committedFixture(t, "trust-proof-baseline.json"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			for i, value := range values {
-				if value != "" {
-					doc = setMember(t, doc, strings.Split(timestampMembers[i], "."), jsonString(t, value))
-				}
-			}
-			var f fixture
-			if err := json.Unmarshal(doc, &f); err != nil {
-				t.Fatal(err)
-			}
-			if got := verify(f); outcome(got) != tc.want {
+			if got := verify(baselineWithTimestamps(t, values)); outcome(got) != tc.want {
 				t.Fatalf("got %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// expiredReasons lists the expiresAt and verifier clockRfc3339 of
+// trust-proof-baseline.json ("" keeps the fixture's value) for which both
+// verifiers return EXPIRED, with the reason both give: each time in UTC, to
+// the microsecond the expiry check compares, with no trailing zeros in the
+// fraction of a second and no fraction when it is zero. The proof expires at
+// 2026-05-24T06:00:00Z and the clock is 2026-05-24T00:00:00Z.
+// ../python/test_verify.py holds the same table.
+var expiredReasons = []struct {
+	expiresAt, clock, want string
+}{
+	{"", "2026-05-24T06:00:01Z", "expired at 2026-05-24T06:00:00Z, verifier clock is 2026-05-24T06:00:01Z"},
+	{"", "2026-05-24T06:00:00.000001Z", "expired at 2026-05-24T06:00:00Z, verifier clock is 2026-05-24T06:00:00.000001Z"},  // a microsecond after the expiry time
+	{"", "2026-05-24T06:00:00.0000019Z", "expired at 2026-05-24T06:00:00Z, verifier clock is 2026-05-24T06:00:00.000001Z"}, // the seventh digit dropped
+	{"", "2026-05-24T06:00:00.500000Z", "expired at 2026-05-24T06:00:00Z, verifier clock is 2026-05-24T06:00:00.5Z"},
+	{"", "2026-05-24T08:00:00.00001+02:00", "expired at 2026-05-24T06:00:00Z, verifier clock is 2026-05-24T06:00:00.00001Z"},
+	{"2026-05-23T23:59:59.999999Z", "", "expired at 2026-05-23T23:59:59.999999Z, verifier clock is 2026-05-24T00:00:00Z"},
+	{"0001-01-01T00:00:00Z", "", "expired at 0001-01-01T00:00:00Z, verifier clock is 2026-05-24T00:00:00Z"},
+}
+
+// TestExpiredReason: the EXPIRED reason writes the expiry time and the
+// verifier's clock to the microsecond the expiry check compares, so a clock
+// a microsecond after the expiry time does not read as the expiry time, and
+// both verifiers give the same reason.
+func TestExpiredReason(t *testing.T) {
+	for _, tc := range expiredReasons {
+		t.Run(tc.expiresAt+","+tc.clock, func(t *testing.T) {
+			got := verify(baselineWithTimestamps(t, []string{"", tc.expiresAt, tc.clock}))
+			if want := "REJECT[EXPIRED: " + tc.want + "]"; got.String() != want {
+				t.Fatalf("got %s, want %s", got, want)
 			}
 		})
 	}

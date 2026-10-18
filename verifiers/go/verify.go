@@ -762,10 +762,15 @@ func verifyTrustProof(f fixture) result {
 	if err != nil {
 		return result{RejectCategory: "PARSE_ERROR", Reason: "bad expiresAt: " + err.Error()}
 	}
+	// The reason writes both times to the microsecond the check compares
+	// (the time.RFC3339Nano layout drops the trailing zeros of a fraction of
+	// a second, and the fraction when it is zero), so a clock a microsecond
+	// after the expiry time does not read as the expiry time. The Python
+	// verifier's _rfc3339_utc writes the same strings.
 	if now.After(expires.UTC()) {
 		return result{
 			RejectCategory: "EXPIRED",
-			Reason:         fmt.Sprintf("expired at %s, verifier clock is %s", expires.UTC().Format(time.RFC3339), now.Format(time.RFC3339)),
+			Reason:         fmt.Sprintf("expired at %s, verifier clock is %s", expires.UTC().Format(time.RFC3339Nano), now.Format(time.RFC3339Nano)),
 		}
 	}
 
