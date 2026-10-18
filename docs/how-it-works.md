@@ -163,6 +163,36 @@ The `repeatedNames` table in
 [`verifiers/python/test_verify.py`](../verifiers/python/test_verify.py)
 hold the same cases for both verifiers.
 
+### Trust-proof timestamps: both verifiers read the years 1 to 9999
+
+Python's `datetime` holds the years 1 to 9999. Go's `time.Parse` with the
+RFC 3339 layout also reads a date written in year 0000, and a zone offset
+can move a timestamp's UTC equivalent out of those years:
+`0001-01-01T00:00:00+01:00` is `0000-12-31T23:00:00Z`, and
+`9999-12-31T23:59:59-01:00` is `10000-01-01T00:59:59Z`, which has no
+RFC 3339 form. The Go verifier would compare such a time where the Python
+verifier cannot read it. So when a trust proof's `issuedAt` or
+`expiresAt`, or the verifier's `clockRfc3339`, has a date as written or a
+UTC equivalent outside the years 1 to 9999, both verifiers refuse it at
+the step that reads it, before any step compares it:
+
+- `issuedAt` or `expiresAt` is `REJECT[PARSE_ERROR]`, the category of a
+  proof timestamp that does not parse, for example
+  `bad expiresAt: 9999-12-31T23:59:59-01:00 falls outside the years 1 to 9999 in UTC`;
+- `clockRfc3339` is `REJECT[VERIFIER_CONFIG_ERROR]`, the category of a
+  verifier clock that does not parse as a timestamp: the clock is
+  verifier configuration, not part of the proof.
+
+A step that runs before the one that reads the timestamp can still reject
+the proof first: with such an `issuedAt`, the expired fixture is
+`EXPIRED`. A timestamp inside those years goes on to the verification
+steps, at either end: with `expiresAt` set to `0001-01-01T00:00:00Z` the
+baseline proof is `EXPIRED`. The `timestampRangeEdges` table in
+[`verifiers/go/verify_test.go`](../verifiers/go/verify_test.go) and the
+`TIMESTAMP_RANGE_EDGES` table in
+[`verifiers/python/test_verify.py`](../verifiers/python/test_verify.py)
+hold the same cases for both verifiers.
+
 ## The fixture generator
 
 The README's [Reproducing the fixtures](../README.md#reproducing-the-fixtures)

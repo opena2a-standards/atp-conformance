@@ -500,6 +500,84 @@ func TestExactMembers(t *testing.T) {
 	}
 }
 
+// timestampMembers are the trust-proof timestamps, as dotted paths in a
+// trustProof fixture.
+var timestampMembers = []string{"trustProof.issuedAt", "trustProof.expiresAt", "verifierState.clockRfc3339"}
+
+// timestampRangeEdges lists timestamps at the edges of the years 1 to 9999,
+// each set in turn as the issuedAt, expiresAt and verifier clockRfc3339 of
+// trust-proof-baseline.json, with the verdict both verifiers return for
+// each: ACCEPT or the REJECT category. A UTC equivalent that differs from
+// the value is noted beside it. ../python/test_verify.py holds the same
+// table.
+var timestampRangeEdges = []struct {
+	value                      string
+	issuedAt, expiresAt, clock string
+}{
+	{"0001-01-01T00:00:00+01:00", "PARSE_ERROR", "PARSE_ERROR", "VERIFIER_CONFIG_ERROR"}, // 0000-12-31T23:00:00Z
+	{"9999-12-31T23:59:59-01:00", "PARSE_ERROR", "PARSE_ERROR", "VERIFIER_CONFIG_ERROR"}, // 10000-01-01T00:59:59Z
+	{"0000-06-15T00:00:00Z", "PARSE_ERROR", "PARSE_ERROR", "VERIFIER_CONFIG_ERROR"},
+	{"0000-12-31T23:30:00-01:00", "PARSE_ERROR", "PARSE_ERROR", "VERIFIER_CONFIG_ERROR"}, // 0001-01-01T00:30:00Z
+	{"0001-01-01T00:00:00Z", "SEMANTIC_INVALID", "EXPIRED", "ACCEPT"},
+	{"0001-01-01T00:59:59+00:59", "SEMANTIC_INVALID", "EXPIRED", "ACCEPT"}, // 0001-01-01T00:00:59Z
+	{"9999-12-31T23:59:59Z", "SEMANTIC_INVALID", "SEMANTIC_INVALID", "EXPIRED"},
+	{"9999-12-31T23:00:00-00:59", "SEMANTIC_INVALID", "SEMANTIC_INVALID", "EXPIRED"}, // 9999-12-31T23:59:00Z
+}
+
+// outOfRangeUTC are the timestamps of timestampRangeEdges that are written
+// inside the years 1 to 9999 and whose UTC equivalent falls outside them.
+// ../python/test_verify.py holds them as OUT_OF_RANGE_TIMES.
+var outOfRangeUTC = []string{"0001-01-01T00:00:00+01:00", "9999-12-31T23:59:59-01:00"}
+
+// TestTimestampRangeEdges: a trust-proof timestamp whose date as written or
+// whose UTC equivalent falls outside the years 1 to 9999 is refused at the
+// step that reads it, before a step compares it. In
+// trust-proof-baseline.json that is PARSE_ERROR as issuedAt or expiresAt and
+// VERIFIER_CONFIG_ERROR as the verifier's clock, with a reason naming the
+// member, the verdicts the Python verifier, whose datetime holds no other
+// years, returns for the same input. time.Parse alone reads a date written
+// in year 0000 and puts the UTC equivalent of an offset time in year 0 or
+// 10000. A timestamp inside the years, at either end, goes on to the
+// verification steps.
+func TestTimestampRangeEdges(t *testing.T) {
+	for _, tc := range timestampRangeEdges {
+		for i, want := range []string{tc.issuedAt, tc.expiresAt, tc.clock} {
+			path := timestampMembers[i]
+			t.Run(path+"="+tc.value, func(t *testing.T) {
+				got := verify(mutatedFixture(t, "trust-proof-baseline.json", path, strconv.Quote(tc.value)))
+				verdict := got.RejectCategory
+				if got.Accepted {
+					verdict = "ACCEPT"
+				}
+				if verdict != want {
+					t.Fatalf("got %s, want %s", got, want)
+				}
+				prefix := "bad " + path[strings.LastIndex(path, ".")+1:] + ": "
+				if (want == "PARSE_ERROR" || want == "VERIFIER_CONFIG_ERROR") && !strings.HasPrefix(got.Reason, prefix) {
+					t.Fatalf("got %s, want a reason beginning %q", got, prefix)
+				}
+			})
+		}
+	}
+}
+
+// TestOutOfRangeUTCReason: both verifiers give the same reason for a
+// timestamp written inside the years 1 to 9999 whose UTC equivalent falls
+// outside them.
+func TestOutOfRangeUTCReason(t *testing.T) {
+	for _, path := range timestampMembers {
+		for _, value := range outOfRangeUTC {
+			t.Run(path+"="+value, func(t *testing.T) {
+				got := verify(mutatedFixture(t, "trust-proof-baseline.json", path, strconv.Quote(value)))
+				want := "bad " + path[strings.LastIndex(path, ".")+1:] + ": " + value + " falls outside the years 1 to 9999 in UTC"
+				if got.Reason != want {
+					t.Fatalf("got %s, want reason %q", got, want)
+				}
+			})
+		}
+	}
+}
+
 // modulePath is where this module lives. `go run <modulePath>@latest`, the
 // README's first command, fails when go.mod declares any other path.
 const modulePath = "github.com/opena2a-standards/atp-conformance/verifiers/go"

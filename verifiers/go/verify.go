@@ -215,6 +215,30 @@ func normalizeRFC3339(s string) string {
 	return t.UTC().Format(time.RFC3339)
 }
 
+// parseTimestamp reads a trust proof's issuedAt or expiresAt, or the
+// verifier's clockRfc3339, with the time.RFC3339 layout, and refuses a time
+// whose date as written or whose UTC equivalent falls outside the years 1 to
+// 9999. time.Parse alone reads a date written in year 0000, and an offset
+// can move the UTC equivalent out of those years:
+// 0001-01-01T00:00:00+01:00 is 0000-12-31T23:00:00Z and
+// 9999-12-31T23:59:59-01:00 is 10000-01-01T00:59:59Z, which has no RFC 3339
+// form. Python's datetime holds only the years 1 to 9999, so the Python
+// verifier cannot read such a time, and both verifiers refuse it rather than
+// one of them verifying it.
+func parseTimestamp(s string) (time.Time, error) {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if t.Year() < 1 {
+		return time.Time{}, fmt.Errorf("%s falls outside the years 1 to 9999 as written", s)
+	}
+	if utc := t.UTC(); utc.Year() < 1 || utc.Year() > 9999 {
+		return time.Time{}, fmt.Errorf("%s falls outside the years 1 to 9999 in UTC", s)
+	}
+	return t, nil
+}
+
 // ---------------------------------------------------------------------------
 // verification result
 // ---------------------------------------------------------------------------
@@ -682,14 +706,14 @@ func verifyTrustProof(f fixture) result {
 		return result{RejectCategory: "PARSE_ERROR", Reason: fmt.Sprintf("trustProof.transparencyLogIndex %d must be >= 0", *tp.TransparencyLogIndex)}
 	}
 
-	now, err := time.Parse(time.RFC3339, f.VerifierState.ClockRFC3339)
+	now, err := parseTimestamp(f.VerifierState.ClockRFC3339)
 	if err != nil {
 		return result{RejectCategory: "VERIFIER_CONFIG_ERROR", Reason: "bad clockRfc3339: " + err.Error()}
 	}
 	now = now.UTC()
 
 	// ATP §4.4 Step 1: expiry.
-	expires, err := time.Parse(time.RFC3339, tp.ExpiresAt)
+	expires, err := parseTimestamp(tp.ExpiresAt)
 	if err != nil {
 		return result{RejectCategory: "PARSE_ERROR", Reason: "bad expiresAt: " + err.Error()}
 	}
@@ -725,7 +749,7 @@ func verifyTrustProof(f fixture) result {
 	if !validVerdict(tp.Verdict) {
 		return result{RejectCategory: "SEMANTIC_INVALID", Reason: "verdict " + tp.Verdict + " not in {passed,warning,blocked,listed,verified,unknown}"}
 	}
-	issued, err := time.Parse(time.RFC3339, tp.IssuedAt)
+	issued, err := parseTimestamp(tp.IssuedAt)
 	if err != nil {
 		return result{RejectCategory: "PARSE_ERROR", Reason: "bad issuedAt: " + err.Error()}
 	}

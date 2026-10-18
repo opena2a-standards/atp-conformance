@@ -2,7 +2,8 @@
 """Regression tests for verify.py: the ATP §8.1 revocation-entry checks, the
 PARSE_ERROR verdict for members of the wrong JSON type and the reading of
 each member by its exact name, under the wire-shape rules both reference
-verifiers apply, the PARSE_ERROR verdict for a value that makes Python
+verifiers apply, the verdicts for trust-proof timestamps at the edges of the
+years 1 to 9999, the PARSE_ERROR verdict for a value that makes Python
 raise OverflowError and for an integer literal too long for int(), and the
 VERIFIER_CONFIG_ERROR verdict or load error for a bad verifierState.
 
@@ -411,32 +412,77 @@ def fixture_text_with(name: str, old: str, new: str) -> str:
 
 
 # RFC 3339 timestamps whose UTC equivalent falls outside the years 1 to 9999
-# that Python's datetime holds, so converting them to UTC raises
-# OverflowError.
+# that Python's datetime holds (0000-12-31T23:00:00Z and
+# 10000-01-01T00:59:59Z), so converting them to UTC raises OverflowError.
 OUT_OF_RANGE_TIMES = ("0001-01-01T00:00:00+01:00", "9999-12-31T23:59:59-01:00")
 
+# The trust-proof timestamps, as dotted paths in a trustProof fixture.
+TIMESTAMP_MEMBERS = ("trustProof.issuedAt", "trustProof.expiresAt", "verifierState.clockRfc3339")
 
-class OverflowErrorTest(unittest.TestCase):
-    """A fixture value that makes a verification step raise OverflowError is
-    REJECT[PARSE_ERROR] for that fixture, not a traceback that ends the run:
-    a directory run goes on to the fixtures after it and prints its summary.
-    The trust-proof steps raise it when they convert issuedAt or expiresAt
-    to UTC and the value is in OUT_OF_RANGE_TIMES; the same value in the
-    verifier's clockRfc3339 is a VERIFIER_CONFIG_ERROR (VerifierStateTest).
-    The number literal 1e400, which json.loads reads as infinity, is refused
-    by the wire-shape check in the integer members the directory run sets it
-    in."""
+# Timestamps at the edges of the years 1 to 9999, each set in turn as the
+# issuedAt, expiresAt and verifier clockRfc3339 of trust-proof-baseline.json,
+# with the verdict both verifiers return for each: ACCEPT or the REJECT
+# category. A UTC equivalent that differs from the value is noted beside it.
+# ../go/verify_test.go holds the same table.
+TIMESTAMP_RANGE_EDGES: list[tuple[str, str, str, str]] = [
+    # (value, verdict as issuedAt, as expiresAt, as clockRfc3339)
+    ("0001-01-01T00:00:00+01:00", "PARSE_ERROR", "PARSE_ERROR", "VERIFIER_CONFIG_ERROR"),  # 0000-12-31T23:00:00Z
+    ("9999-12-31T23:59:59-01:00", "PARSE_ERROR", "PARSE_ERROR", "VERIFIER_CONFIG_ERROR"),  # 10000-01-01T00:59:59Z
+    ("0000-06-15T00:00:00Z", "PARSE_ERROR", "PARSE_ERROR", "VERIFIER_CONFIG_ERROR"),
+    ("0000-12-31T23:30:00-01:00", "PARSE_ERROR", "PARSE_ERROR", "VERIFIER_CONFIG_ERROR"),  # 0001-01-01T00:30:00Z
+    ("0001-01-01T00:00:00Z", "SEMANTIC_INVALID", "EXPIRED", "ACCEPT"),
+    ("0001-01-01T00:59:59+00:59", "SEMANTIC_INVALID", "EXPIRED", "ACCEPT"),  # 0001-01-01T00:00:59Z
+    ("9999-12-31T23:59:59Z", "SEMANTIC_INVALID", "SEMANTIC_INVALID", "EXPIRED"),
+    ("9999-12-31T23:00:00-00:59", "SEMANTIC_INVALID", "SEMANTIC_INVALID", "EXPIRED"),  # 9999-12-31T23:59:00Z
+]
 
-    def test_out_of_range_time_is_parse_error(self) -> None:
-        for path in ("trustProof.issuedAt", "trustProof.expiresAt"):
+
+class TimestampRangeTest(unittest.TestCase):
+    """A trust-proof timestamp whose date as written or whose UTC equivalent
+    falls outside the years 1 to 9999 is refused at the step that reads it,
+    before a step compares it. In trust-proof-baseline.json that is
+    REJECT[PARSE_ERROR] as issuedAt or expiresAt and
+    REJECT[VERIFIER_CONFIG_ERROR] as the verifier's clock, with a reason
+    naming the member, the verdicts the Go verifier returns for the same
+    input. Python's datetime holds no other years, where Go's time package
+    reads a date written in year 0000 and puts the UTC equivalent of an
+    offset time in year 0 or 10000. A timestamp inside the years, at either
+    end, goes on to the verification steps."""
+
+    def test_timestamp_range_edges(self) -> None:
+        for value, *wants in TIMESTAMP_RANGE_EDGES:
+            for path, want in zip(TIMESTAMP_MEMBERS, wants):
+                with self.subTest(path=path, value=value):
+                    got = verify.verify_fixture(
+                        with_member(load("trust-proof-baseline.json"), path, json.dumps(value))
+                    )
+                    self.assertEqual("ACCEPT" if got.accepted else got.reject_category, want, str(got))
+                    if want in ("PARSE_ERROR", "VERIFIER_CONFIG_ERROR"):
+                        prefix = f"bad {path.rsplit('.', 1)[-1]}: "
+                        self.assertTrue(got.reason.startswith(prefix), f"{got} does not begin {prefix!r}")
+
+    def test_out_of_range_utc_reason(self) -> None:
+        """Both verifiers give the same reason for a timestamp written inside
+        the years whose UTC equivalent falls outside them."""
+        for path in TIMESTAMP_MEMBERS:
             for value in OUT_OF_RANGE_TIMES:
                 with self.subTest(path=path, value=value):
                     got = verify.verify_fixture(
                         with_member(load("trust-proof-baseline.json"), path, json.dumps(value))
                     )
-                    self.assertFalse(got.accepted, str(got))
-                    self.assertEqual(got.reject_category, "PARSE_ERROR", str(got))
-                    self.assertIn("OverflowError", got.reason)
+                    member = path.rsplit(".", 1)[-1]
+                    self.assertEqual(got.reason, f"bad {member}: {value} falls outside the years 1 to 9999 in UTC")
+
+
+class OverflowErrorTest(unittest.TestCase):
+    """A fixture value that makes Python raise OverflowError is
+    REJECT[PARSE_ERROR] for that fixture, not a traceback that ends the run:
+    a directory run goes on to the fixtures after it and prints its summary.
+    The number literal 1e400, which json.loads reads as infinity, is refused
+    by the wire-shape check in the integer members the directory run sets it
+    in, and an expiresAt in OUT_OF_RANGE_TIMES, whose conversion to UTC
+    raises OverflowError, by the trust-proof timestamp check
+    (TimestampRangeTest)."""
 
     def test_directory_run_continues_and_prints_summary(self) -> None:
         files = {
@@ -470,7 +516,7 @@ class OverflowErrorTest(unittest.TestCase):
             ["FAIL", "FAIL", "FAIL", "FAIL", "PASS"],
         )
         self.assertEqual(len(observed), 5, observed)
-        for got, wanted in zip(observed, ("transparencyLogIndex", "logIndex", "treeSize", "OverflowError")):
+        for got, wanted in zip(observed, ("transparencyLogIndex", "logIndex", "treeSize", "bad expiresAt: ")):
             self.assertTrue(got.startswith("observed: REJECT[PARSE_ERROR"), got)
             self.assertIn(wanted, got)
         self.assertEqual(observed[-1], "observed: ACCEPT")

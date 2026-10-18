@@ -81,6 +81,12 @@ A JSON object that repeats a member name is refused by both:
 `REJECT[PARSE_ERROR]` inside a payload member and a load error elsewhere
 in the fixture
 ([rule](docs/how-it-works.md#repeated-member-names-both-verifiers-refuse-them)).
+A trust proof's `issuedAt` or `expiresAt`, or the verifier's
+`clockRfc3339`, whose date as written or UTC equivalent falls outside the
+years 1 to 9999 is refused by both at the step that reads it:
+`REJECT[PARSE_ERROR]` for the proof's timestamps and
+`REJECT[VERIFIER_CONFIG_ERROR]` for the clock
+([rule](docs/how-it-works.md#trust-proof-timestamps-both-verifiers-read-the-years-1-to-9999)).
 
 ## Scope
 
