@@ -21,6 +21,9 @@ Spec coverage:
     or whose UTC equivalent falls outside the years 1 to 9999 is
     REJECT[PARSE_ERROR] at the step that reads it, and such a verifier
     clockRfc3339 is REJECT[VERIFIER_CONFIG_ERROR], as in the Go verifier
+  - verifier state: verifierState is decoded with the Go verifier's
+    encoding/json rules, so an absent or null member is its zero value and
+    a member of the wrong JSON type is a load error
 
 Out of scope:
   - ML-DSA-65 verification. The post-quantum Python library landscape is

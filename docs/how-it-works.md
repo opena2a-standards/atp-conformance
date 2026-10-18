@@ -193,6 +193,30 @@ baseline proof is `EXPIRED`. The `timestampRangeEdges` table in
 [`verifiers/python/test_verify.py`](../verifiers/python/test_verify.py)
 hold the same cases for both verifiers.
 
+### Verifier configuration: `verifierState` decodes to zero values
+
+`verifierState` is the verifier's configuration (its clock, trusted
+issuers and public keys), not a protocol response, so the wire type rules
+above do not apply to it. Both verifiers read it the way the Go
+verifier's `encoding/json` decode does:
+
+- an absent or `null` member, `verifierState` itself included, is its
+  zero value (`""` or an empty array), and the verification steps then
+  judge it. With no `verifierState`, a Signed Tree Head is
+  `REJECT[SIGNATURE_INVALID]` (no configured key), a trust proof is
+  `REJECT[VERIFIER_CONFIG_ERROR]` (no clock) and a discovery response is
+  `REJECT[UNTRUSTED_ISSUER]` (no trusted issuer). A Signed Tree Head whose
+  one configured key has no `publicKeyHex` is `REJECT[SIGNATURE_INVALID]`
+  too;
+- a member of the wrong JSON type, such as a number for `clockRfc3339` or
+  an object for `publicKeys`, is a load error.
+
+The `verifierStateMembers` table in
+[`verifiers/go/verify_test.go`](../verifiers/go/verify_test.go) and the
+`VERIFIER_STATE_MEMBERS` table in
+[`verifiers/python/test_verify.py`](../verifiers/python/test_verify.py)
+hold the same cases for both verifiers.
+
 ## The fixture generator
 
 The README's [Reproducing the fixtures](../README.md#reproducing-the-fixtures)

@@ -412,6 +412,76 @@ func TestCaseVariantMemberIsAbsent(t *testing.T) {
 	}
 }
 
+// verifierStateMembers leaves one member of a committed fixture's
+// verifierState, the verifier configuration, out (literal "") or replaces it
+// with the raw JSON literal, with the outcome both verifiers return: ACCEPT,
+// the REJECT category, or "load error". ../python/test_verify.py holds the
+// same table.
+var verifierStateMembers = []struct {
+	fixture string
+	path    string
+	literal string
+	want    string
+}{
+	{"transparency-log-sth.json", "verifierState", "", "SIGNATURE_INVALID"},
+	{"transparency-log-sth.json", "verifierState", "null", "SIGNATURE_INVALID"},
+	{"transparency-log-sth.json", "verifierState.publicKeys", "", "SIGNATURE_INVALID"},
+	{"transparency-log-sth.json", "verifierState.publicKeys", "null", "SIGNATURE_INVALID"},
+	{"transparency-log-sth.json", "verifierState.publicKeys.0.publicKeyHex", "", "SIGNATURE_INVALID"},
+	{"transparency-log-sth.json", "verifierState.publicKeys.0.publicKeyHex", "null", "SIGNATURE_INVALID"},
+	{"transparency-log-sth.json", "verifierState.publicKeys.0.algorithm", "", "SIGNATURE_INVALID"},
+	{"trust-proof-baseline.json", "verifierState", "", "VERIFIER_CONFIG_ERROR"},
+	{"trust-proof-baseline.json", "verifierState.clockRfc3339", "", "VERIFIER_CONFIG_ERROR"},
+	{"trust-proof-baseline.json", "verifierState.clockRfc3339", "null", "VERIFIER_CONFIG_ERROR"},
+	{"trust-proof-baseline.json", "verifierState.trustedIssuers", "", "UNTRUSTED_ISSUER"},
+	{"discovery-valid.json", "verifierState", "", "UNTRUSTED_ISSUER"},
+	{"discovery-valid.json", "verifierState.trustedIssuers.0", "null", "UNTRUSTED_ISSUER"},
+	{"transparency-inclusion-proof-valid.json", "verifierState", "", "SIGNATURE_INVALID"},
+	{"transparency-consistency-proof-valid.json", "verifierState", "", "SIGNATURE_INVALID"},
+	{"transparency-log-sth.json", "verifierState", `"x"`, "load error"},
+	{"transparency-log-sth.json", "verifierState.publicKeys", `{}`, "load error"},
+	{"transparency-log-sth.json", "verifierState.publicKeys.0.publicKeyHex", `5`, "load error"},
+	{"trust-proof-baseline.json", "verifierState.clockRfc3339", `5`, "load error"},
+}
+
+// TestVerifierStateMember: parseFixture decodes verifierState with
+// encoding/json, so an absent or null member is its zero value, which the
+// verification steps then judge (no clock, no trusted issuer, no public
+// key), and a member of the wrong JSON type is a load error, the outcome the
+// Python verifier returns for the same input. The unmodified fixtures verify
+// ACCEPT (TestSchemaTypeViolationIsParseError checks each one).
+func TestVerifierStateMember(t *testing.T) {
+	for _, tc := range verifierStateMembers {
+		t.Run(tc.fixture+":"+tc.path+"="+tc.literal, func(t *testing.T) {
+			doc, err := os.ReadFile(filepath.Join("..", "..", "fixtures", tc.fixture))
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := strings.Split(tc.path, ".")
+			if tc.literal == "" {
+				doc = renameMember(t, doc, path, "")
+			} else {
+				doc = setMember(t, doc, path, tc.literal)
+			}
+			f, err := parseFixture(doc)
+			if err != nil {
+				if tc.want != "load error" {
+					t.Fatalf("load error %v, want %s", err, tc.want)
+				}
+				return
+			}
+			got := verify(f)
+			verdict := got.RejectCategory
+			if got.Accepted {
+				verdict = "ACCEPT"
+			}
+			if verdict != tc.want {
+				t.Fatalf("got %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
 // repeatedNames writes a member name twice into one JSON object of a
 // committed ACCEPT fixture: old occurs once in the file and new replaces it.
 // Inside a payload member the repeat is REJECT[PARSE_ERROR] naming the first
